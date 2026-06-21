@@ -240,25 +240,73 @@ vless://<uuid>@<domain>:443?encryption=none&security=tls&type=ws&host=<domain>&p
 
 ---
 
-## 🤖 Telegram Bot
+## 🤖 Telegram Bot — Full Integration Details
 
-Configure the bot from the panel's **Settings** page (token + your numeric Telegram admin ID) — no redeploy needed, it connects live. The bot UI is bilingual (Persian/English, switchable via an inline button) and supports the following commands:
+The Telegram bot is built into `main.py` using `pyTelegramBotAPI` (`AsyncTeleBot`) and is **fully wired to the live panel state** — it reads/writes the exact same `LINKS` dict and `CUSTOM_ADDRESSES` list the web dashboard uses, so any change made from Telegram instantly shows up in the panel and vice versa.
+
+### How it connects to the panel
+
+1. Open the panel → **Settings** page.
+2. Enter your **bot token** (from [@BotFather](https://t.me/BotFather)) and your **numeric Telegram admin ID** (e.g. from [@userinfobot](https://t.me/userinfobot)) into the `tg-token` / `tg-admin-id` fields.
+3. Click save → the frontend calls `saveSettings()`, which sends `POST /api/settings`.
+4. The backend (`update_settings`):
+   - Saves the token/admin ID into `CONFIG["telegram_token"]` / `CONFIG["telegram_admin_id"]`.
+   - Persists them to `panel_db.json` via `save_db()`.
+   - Immediately calls `restart_telegram_bot()` — **no server restart or redeploy required**, the bot goes live within seconds.
+5. On every startup, `load_db()` restores the saved token/admin ID and `restart_telegram_bot()` is called automatically so the bot reconnects without re-entering credentials.
+
+### Token validation & safe restart logic
+
+`restart_telegram_bot()` doesn't just blindly start polling — it does several safety steps:
+
+- First calls `_stop_telegram_bot()` to cleanly cancel any previous polling task. This matters because **Telegram only allows one active `getUpdates` long-polling connection per bot token** — without this cleanup, saving settings twice would spawn duplicate pollers that fight each other (`409 Conflict`), and commands could silently stop being delivered.
+- Calls Telegram's `deleteWebhook?drop_pending_updates=true` to clear any stale webhook/update queue.
+- Calls `getMe` to **verify the token is actually valid** before starting the bot. If Telegram rejects it, the bot is not started and an error is logged — it won't crash the panel.
+- Only after the token is confirmed does it instantiate `AsyncTeleBot(token)` and start the polling loop as a background `asyncio.Task` (`bot_polling_task`).
+- If `pyTelegramBotAPI` isn't installed, this whole flow is skipped gracefully and just logs a warning — the rest of the panel keeps working.
+
+### Admin-only access control
+
+Every single command handler calls `_is_admin_chat(message.chat.id, admin_id)` first. If the chat ID sending the command doesn't match the configured admin ID exactly, the message is **silently ignored** (and logged as a warning server-side) — the bot will not respond to anyone except the configured admin, even if they have the bot token.
+
+### Bilingual interface
+
+All bot text comes from the `BOT_I18N` dictionary (`en` / `fa`), the same i18n pattern used by the web panel. Language is stored in `CONFIG["bot_lang"]` and persisted to `panel_db.json`. A 🇮🇷/🇬🇧 inline button on the main menu calls the `tg_lang_toggle` callback to flip it instantly, without restarting the bot.
+
+### Commands
 
 | Command | Description |
 |---|---|
-| `/start` | Welcome message with main inline menu |
-| `/stats` | Server dashboard: domain, CPU, memory, uptime, active connections, total traffic, inbound count |
-| `/users` | List all users with usage, expiry date, and on/off status |
-| `/top` | Top 5 users ranked by traffic usage |
-| `/create [name] [limit_GB] [days]` | Create a new inbound. Use `0` for unlimited quota / no expiry. Example: `/create Ali 15 30` |
-| `/addaddr [ip_or_domain]` | Add a clean IP/domain to the subscription pool |
-| `/disable [username]` | Disable a user's access |
-| `/enable [username]` | Re-enable a user's access |
-| `/reset [username]` | Reset a user's traffic usage back to 0 |
+| `/start` | Welcome message + inline main menu (`build_main_keyboard()`): Stats, Users, Top Users, Create User guide, Add Clean IP guide, Language toggle |
+| `/stats` | Live server dashboard: domain, CPU %, memory %, uptime, active connections, total traffic (MB), inbound count — pulled from the same data as `/stats` HTTP endpoint |
+| `/users` | Full list of all inbounds with usage, limit, expiry date, and 🟢/🔴 on-off status |
+| `/top` | Top 5 inbounds ranked by `used_bytes`, descending |
+| `/create [name] [limit_GB] [days]` | Creates a new inbound directly in `LINKS` (same as the web "Create" form). Validates name (English letters/numbers only), numeric limit, integer days. `0`/`0` = unlimited quota, no expiry. Example: `/create Ali 15 30`. Replies with the full VLESS link + subscription URL. |
+| `/addaddr [ip_or_domain]` | Appends to `CUSTOM_ADDRESSES` — same list the panel's Clean IP page manages. Rejects duplicates and invalid characters. |
+| `/disable [username]` | Sets `LINKS[name]["active"] = False` — instantly drops the inbound's ability to accept new WebSocket connections |
+| `/enable [username]` | Sets `LINKS[name]["active"] = True` |
+| `/reset [username]` | Sets `used_bytes` back to `0` for that inbound |
 
-The bot also proactively notifies the admin:
-- ⚠️ **Quota alert** — sent once a user reaches their traffic limit
-- ⏰ **Expiry alert** — sent once a user's subscription expires
+Inline buttons on `/start`/menu also expose **guided help text** for `/create` and `/addaddr` (`create_guide` / `addip_guide`) so the admin doesn't need to remember the exact syntax.
+
+Every command that changes state (`/create`, `/disable`, `/enable`, `/reset`, `/addaddr`) calls `save_db()` immediately afterward, so changes made via Telegram are persisted to `panel_db.json` exactly like changes made via the web UI.
+
+### Automatic background alerts
+
+A separate background task, `telegram_notifier_cron()`, runs continuously (started at app startup via `asyncio.create_task`) and checks **every 60 seconds**:
+
+- **⚠️ Quota alert** — for every *active* inbound, if `used_bytes >= limit_bytes` (and `limit_bytes > 0`), it sends `quota_alert` to the admin chat. 
+- **⏰ Expiry alert** — if an inbound's `expires_at` timestamp is in the past, it sends `expiry_alert` to the admin chat.
+
+To avoid spamming the admin every minute, each alert is only sent **once per inbound per condition**, tracked via an in-memory `notified_uids` set (keys like `quota_<uid>` / `expiry_<uid>`). If the cron finds no Telegram token/admin ID configured, it simply sleeps and rechecks every 60 seconds without doing anything.
+
+### Quota & expiry enforcement is also live on the proxy itself
+
+This isn't just a notification feature — `check_quota(uid, extra_bytes)` is called on **every single packet** flowing through the `/ws/{uuid}` proxy tunnel (both `ws_to_tcp` and `tcp_to_ws` directions). If a user is disabled, expired, or over quota, the WebSocket connection is immediately closed with code `1008`. So disabling a user from Telegram, or a quota alert firing, reflects an actual connection cutoff — not just a dashboard number.
+
+### Per-inbound connection limit
+
+`max_connections` (settable from the web panel's edit form, field `ec`) is enforced in the `/ws/{uuid}` handler **before** the WebSocket handshake completes: if `count_connections_for_link(uuid) >= max_connections`, the new connection is rejected pre-handshake (so it looks like a normal closed/forbidden endpoint to DPI probes, not a live VLESS server — see the in-code comment on this design choice). Deleting an inbound (via panel or could be extended to Telegram) calls `close_connections_for_link(uid)` to force-drop all of that inbound's currently active sessions right away.
 
 ---
 
@@ -544,25 +592,73 @@ vless://<uuid>@<domain>:443?encryption=none&security=tls&type=ws&host=<domain>&p
 
 ---
 
-## 🤖 ربات تلگرام
+## 🤖 ربات تلگرام — جزئیات کامل یکپارچه‌سازی
 
-ربات را از صفحه **تنظیمات** پنل کانفیگ کنید (توکن + آیدی عددی تلگرام شما به‌عنوان ادمین) — نیازی به دیپلوی مجدد نیست، به‌صورت زنده وصل می‌شود. رابط ربات دو زبانه است (فارسی/انگلیسی، با یک دکمه inline قابل تغییر) و دستورات زیر را پشتیبانی می‌کند:
+ربات تلگرام مستقیم داخل `main.py` با کتابخانه `pyTelegramBotAPI` (کلاس `AsyncTeleBot`) ساخته شده و **کاملاً به وضعیت زنده پنل وصله** — یعنی دقیقاً همون دیکشنری `LINKS` و لیست `CUSTOM_ADDRESSES` که داشبورد وب استفاده می‌کنه رو می‌خونه و می‌نویسه؛ پس هر تغییری که از تلگرام انجام بدی، فوراً توی پنل هم دیده می‌شه و برعکس.
+
+### نحوه اتصال ربات به پنل
+
+1. پنل رو باز کن ← صفحه **تنظیمات**.
+2. **توکن ربات** (از [@BotFather](https://t.me/BotFather)) و **آیدی عددی تلگرام** خودت به‌عنوان ادمین (مثلاً از [@userinfobot](https://t.me/userinfobot)) رو در فیلدهای `tg-token` / `tg-admin-id` وارد کن.
+3. روی ذخیره بزن → فرانت‌اند تابع `saveSettings()` رو صدا می‌زنه که درخواست `POST /api/settings` می‌فرسته.
+4. بک‌اند (تابع `update_settings`):
+   - توکن/آیدی ادمین رو در `CONFIG["telegram_token"]` / `CONFIG["telegram_admin_id"]` ذخیره می‌کنه.
+   - با `save_db()` در فایل `panel_db.json` پایدارش می‌کنه.
+   - فوراً `restart_telegram_bot()` رو صدا می‌زنه — **نیازی به ریستارت سرور یا دیپلوی مجدد نیست**، ربات ظرف چند ثانیه فعال می‌شه.
+5. در هر استارت برنامه، `load_db()` توکن/آیدی ذخیره‌شده رو بازیابی می‌کنه و `restart_telegram_bot()` به‌صورت خودکار صدا زده می‌شه تا ربات بدون نیاز به وارد کردن مجدد اطلاعات وصل بشه.
+
+### اعتبارسنجی توکن و منطق ری‌استارت ایمن
+
+تابع `restart_telegram_bot()` فقط کورکورانه polling رو شروع نمی‌کنه، بلکه چند مرحله ایمنی داره:
+
+- اول `_stop_telegram_bot()` رو صدا می‌زنه تا هر تسک polling قبلی به‌طور تمیز کنسل بشه. این موضوع مهمه چون **تلگرام فقط اجازه یک اتصال long-polling فعال (`getUpdates`) برای هر توکن ربات** رو می‌ده — بدون این مرحله، ذخیره دوباره تنظیمات باعث می‌شد چند poller هم‌زمان با هم تداخل کنن (خطای `409 Conflict`) و دستورات مثل `/start` به‌طور خاموش از کار بیفتن.
+- با فراخوانی `deleteWebhook?drop_pending_updates=true` هر webhook یا صف آپدیت قدیمی رو پاک می‌کنه.
+- با فراخوانی `getMe` **اعتبار واقعی توکن** رو قبل از استارت ربات بررسی می‌کنه. اگه تلگرام توکن رو رد کنه، ربات استارت نمی‌خوره و فقط یک خطا لاگ می‌شه — پنل کرش نمی‌کنه.
+- فقط بعد از تایید توکن، شیء `AsyncTeleBot(token)` ساخته می‌شه و حلقه polling به‌عنوان یک تسک پس‌زمینه `asyncio.Task` (`bot_polling_task`) استارت می‌خوره.
+- اگه `pyTelegramBotAPI` نصب نباشه، کل این روند به‌آرامی رد می‌شه و فقط یک هشدار لاگ می‌شه — بقیه پنل به‌درستی کار می‌کنه.
+
+### کنترل دسترسی فقط برای ادمین
+
+هر هندلر دستوری اول تابع `_is_admin_chat(message.chat.id, admin_id)` رو صدا می‌زنه. اگه آیدی چت فرستنده دستور دقیقاً با آیدی ادمین تنظیم‌شده مطابقت نداشته باشه، پیام **به‌طور کامل و خاموش نادیده گرفته می‌شه** (و سمت سرور به‌عنوان هشدار لاگ می‌شه) — ربات به هیچ‌کس جز ادمین تنظیم‌شده پاسخ نمی‌ده، حتی اگه توکن ربات رو هم داشته باشه.
+
+### رابط دو زبانه
+
+همه متن‌های ربات از دیکشنری `BOT_I18N` (`en` / `fa`) میان، همون الگوی i18n که پنل وب استفاده می‌کنه. زبان در `CONFIG["bot_lang"]` ذخیره و در `panel_db.json` پایدار می‌شه. یک دکمه inline 🇮🇷/🇬🇧 روی منوی اصلی، callback به نام `tg_lang_toggle` رو صدا می‌زنه تا زبان فوراً بدون ری‌استارت ربات عوض بشه.
+
+### دستورات
 
 | دستور | توضیح |
 |---|---|
-| `/start` | پیام خوش‌آمد به همراه منوی اصلی inline |
-| `/stats` | داشبورد سرور: دامنه، CPU، رم، آپ‌تایم، اتصالات فعال، ترافیک کل، تعداد اینباند |
-| `/users` | لیست همه کاربران با میزان مصرف، تاریخ انقضا و وضعیت روشن/خاموش |
-| `/top` | ۵ کاربر برتر بر اساس میزان مصرف ترافیک |
-| `/create [نام] [حجم_GB] [روز]` | ساخت اینباند جدید. از `0` برای نامحدود/بدون انقضا استفاده کنید. مثال: `/create Ali 15 30` |
-| `/addaddr [آی‌پی_یا_دامنه]` | افزودن آی‌پی/دامنه تمیز به استخر اشتراک |
-| `/disable [نام‌کاربری]` | غیرفعال کردن دسترسی کاربر |
-| `/enable [نام‌کاربری]` | فعال‌سازی مجدد دسترسی کاربر |
-| `/reset [نام‌کاربری]` | صفر کردن مصرف ترافیک کاربر |
+| `/start` | پیام خوش‌آمد + منوی اصلی inline (`build_main_keyboard()`): آمار، کاربران، پرمصرف‌ترین‌ها، راهنمای ساخت کاربر، راهنمای افزودن آی‌پی تمیز، تغییر زبان |
+| `/stats` | داشبورد زنده سرور: دامنه، درصد CPU، درصد رم، آپ‌تایم، اتصالات فعال، ترافیک کل (MB)، تعداد اینباند — از همون داده‌ای که endpoint وب `/stats` استفاده می‌کنه |
+| `/users` | لیست کامل همه اینباندها با مصرف، سقف، تاریخ انقضا و وضعیت 🟢/🔴 |
+| `/top` | ۵ اینباند برتر بر اساس `used_bytes`، نزولی |
+| `/create [نام] [حجم_GB] [روز]` | ساخت مستقیم اینباند جدید در `LINKS` (دقیقاً مثل فرم «ساخت» در پنل وب). نام (فقط حروف/عدد انگلیسی)، حجم عددی، روز عدد صحیح رو اعتبارسنجی می‌کنه. `0`/`0` یعنی حجم نامحدود و بدون انقضا. مثال: `/create Ali 15 30`. در پاسخ، لینک کامل VLESS + آدرس اشتراک رو می‌فرسته. |
+| `/addaddr [آی‌پی_یا_دامنه]` | به `CUSTOM_ADDRESSES` اضافه می‌کنه — دقیقاً همون لیستی که صفحه آی‌پی تمیز پنل مدیریت می‌کنه. آدرس تکراری و کاراکتر نامعتبر رد می‌شه. |
+| `/disable [نام‌کاربری]` | `LINKS[name]["active"]` رو `False` می‌کنه — فوراً امکان پذیرفتن اتصال WebSocket جدید برای اون اینباند قطع می‌شه |
+| `/enable [نام‌کاربری]` | `LINKS[name]["active"]` رو `True` می‌کنه |
+| `/reset [نام‌کاربری]` | `used_bytes` اون اینباند رو به `0` برمی‌گردونه |
 
-ربات همچنین به‌صورت خودکار به ادمین اطلاع می‌دهد:
-- ⚠️ **هشدار اتمام حجم** — وقتی کاربر به سقف مصرفش برسد
-- ⏰ **هشدار انقضا** — وقتی اشتراک کاربر تمام شود
+دکمه‌های inline روی منوی `/start` همچنین **متن راهنمای گام‌به‌گام** برای `/create` و `/addaddr` (`create_guide` / `addip_guide`) رو نمایش می‌دن تا ادمین نیازی به حفظ کردن سینتکس دقیق نداشته باشه.
+
+هر دستوری که وضعیت رو تغییر می‌ده (`/create`، `/disable`، `/enable`، `/reset`، `/addaddr`) بلافاصله بعدش `save_db()` رو صدا می‌زنه، پس تغییرات انجام‌شده از تلگرام دقیقاً مثل تغییرات پنل وب در `panel_db.json` ذخیره می‌شن.
+
+### هشدارهای خودکار پس‌زمینه
+
+یک تسک پس‌زمینه جدا به نام `telegram_notifier_cron()` به‌صورت مداوم اجرا می‌شه (موقع استارت برنامه با `asyncio.create_task` راه‌اندازی می‌شه) و **هر ۶۰ ثانیه** این موارد رو چک می‌کنه:
+
+- **⚠️ هشدار اتمام حجم** — برای هر اینباند *فعال*، اگه `used_bytes >= limit_bytes` باشه (و `limit_bytes > 0`)، پیام `quota_alert` به چت ادمین فرستاده می‌شه.
+- **⏰ هشدار انقضا** — اگه زمان `expires_at` یک اینباند گذشته باشه، پیام `expiry_alert` به چت ادمین فرستاده می‌شه.
+
+برای اینکه ادمین هر دقیقه اسپم نشه، هر هشدار فقط **یک‌بار به‌ازای هر اینباند و هر شرط** فرستاده می‌شه، که با یک `set` در حافظه به نام `notified_uids` ردیابی می‌شه (کلیدهایی مثل `quota_<uid>` / `expiry_<uid>`). اگه توکن یا آیدی ادمین تنظیم نشده باشه، این تسک فقط می‌خوابه و هر ۶۰ ثانیه دوباره چک می‌کنه بدون اینکه کاری انجام بده.
+
+### اعمال محدودیت حجم و انقضا روی خود پراکسی هم زنده است
+
+این فقط یک قابلیت اعلان نیست — تابع `check_quota(uid, extra_bytes)` روی **هر پکت** که از تونل پراکسی `/ws/{uuid}` رد می‌شه صدا زده می‌شه (هم در مسیر `ws_to_tcp` هم `tcp_to_ws`). اگه کاربری غیرفعال، منقضی یا بیش از سقف مصرفش شده باشه، اتصال WebSocket فوراً با کد `1008` بسته می‌شه. پس غیرفعال کردن کاربر از تلگرام، یا فعال شدن هشدار اتمام حجم، یک قطع اتصال واقعی رو نشون می‌ده — نه فقط یک عدد روی داشبورد.
+
+### محدودیت تعداد اتصال هر اینباند
+
+`max_connections` (که از فرم ویرایش پنل وب، فیلد `ec`، قابل تنظیمه) داخل هندلر `/ws/{uuid}` **قبل از تکمیل handshake وب‌سوکت** اعمال می‌شه: اگه `count_connections_for_link(uuid) >= max_connections` باشه، اتصال جدید قبل از handshake رد می‌شه (طوری که از دید پروب‌های DPI شبیه یک endpoint بسته/ممنوع عادی به نظر برسه، نه یک سرور VLESS زنده — به کامنت داخل کد در مورد این تصمیم طراحی مراجعه کن). حذف یک اینباند (از پنل، و قابل توسعه برای تلگرام هم) تابع `close_connections_for_link(uid)` رو صدا می‌زنه تا همه سشن‌های فعال اون اینباند فوراً قطع بشن.
 
 ---
 
