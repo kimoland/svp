@@ -1,10 +1,10 @@
-# 🏴‍☠️ Luffy Panel
+# 🏴‍☠️ sLv Panel
 
 A lightweight VLESS-over-WebSocket proxy panel built with FastAPI, deployable on [Render](https://render.com) or [Railway](https://railway.app).
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/luffy-sh-op/LUFFY_PANEL)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/SaLVaToR0x/SLV_PANEL)
 &nbsp;&nbsp;
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/luffy-sh-op/LUFFY_PANEL)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/SaLVaToR0x/SLV_PANEL)
 
 ---
 
@@ -45,7 +45,7 @@ A lightweight VLESS-over-WebSocket proxy panel built with FastAPI, deployable on
 
 ### One-click via `render.yaml`
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/luffy-sh-op/LUFFY_PANEL)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/SaLVaToR0x/SLV_PANEL)
 
 1. Fork or push this repo to GitHub.
 2. Go to [render.com](https://render.com) → **New Web Service** → connect your repo.
@@ -80,7 +80,7 @@ A lightweight VLESS-over-WebSocket proxy panel built with FastAPI, deployable on
 
 ### One-click deploy
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/luffy-sh-op/LUFFY_PANEL)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/SaLVaToR0x/SLV_PANEL)
 
 1. Fork or push this repo to GitHub.
 2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo** → select your repo.
@@ -222,7 +222,7 @@ pyTelegramBotAPI
 ## 🌐 VLESS Config Format
 
 ```
-vless://<uuid>@<domain>:443?encryption=none&security=tls&type=ws&host=<domain>&path=/ws/<uuid>&sni=<domain>&fp=chrome&alpn=http/1.1#Luffy-<name>
+vless://<uuid>@<domain>:443?encryption=none&security=tls&type=ws&host=<domain>&path=/ws/<uuid>&sni=<domain>&fp=chrome&alpn=http/1.1#sLv-<name>
 ```
 
 ---
@@ -344,19 +344,19 @@ MIT — use freely, modify as needed.
 
 ---
 
-[My Telegram channel](https://t.me/Luffy_sh_op)
+
 
 ---
 ---
 ---
 
-# 🏴‍☠️ لوفی پنل
+# 🏴‍☠️ sLv پنل
 
 یک پنل پراکسی سبک VLESS-over-WebSocket ساخته‌شده با FastAPI، قابل استقرار روی [Render](https://render.com) یا [Railway](https://railway.app).
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/luffy-sh-op/LUFFY_PANEL)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/SaLVaToR0x/SLV_PANEL)
 &nbsp;&nbsp;
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/luffy-sh-op/LUFFY_PANEL)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/SaLVaToR0x/SLV_PANEL)
 
 ---
 
@@ -397,7 +397,7 @@ MIT — use freely, modify as needed.
 
 ### یک‌کلیکی با `render.yaml`
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/luffy-sh-op/LUFFY_PANEL)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/SaLVaToR0x/SLV_PANEL)
 
 1. ریپو را fork کنید یا روی GitHub آپلود کنید.
 2. به [render.com](https://render.com) بروید ← **New Web Service** ← ریپو را متصل کنید.
@@ -432,7 +432,7 @@ MIT — use freely, modify as needed.
 
 ### استقرار یک‌کلیکی
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/luffy-sh-op/LUFFY_PANEL)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/SaLVaToR0x/SLV_PANEL)
 
 1. ریپو را fork کنید یا روی GitHub آپلود کنید.
 2. به [railway.app](https://railway.app) بروید ← **New Project** ← **Deploy from GitHub repo** ← ریپو را انتخاب کنید.
@@ -574,7 +574,7 @@ pyTelegramBotAPI
 ## 🌐 فرمت کانفیگ VLESS
 
 ```
-vless://<uuid>@<domain>:443?encryption=none&security=tls&type=ws&host=<domain>&path=/ws/<uuid>&sni=<domain>&fp=chrome&alpn=http/1.1#Luffy-<name>
+vless://<uuid>@<domain>:443?encryption=none&security=tls&type=ws&host=<domain>&path=/ws/<uuid>&sni=<domain>&fp=chrome&alpn=http/1.1#sLV-<name>
 ```
 
 ---
@@ -696,4 +696,3 @@ MIT — آزادانه استفاده و ویرایش کنید.
 
 ---
 
-[چنل تلگراممون](https://t.me/Luffy_sh_op)
