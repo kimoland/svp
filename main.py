@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import time
 import re
+import random
 import base64
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
@@ -57,6 +58,7 @@ CONFIG = {
     "telegram_admin_id": "",
     "bot_lang": "en",
     "cookie_secure": os.environ.get("COOKIE_SECURE", "auto").lower(),
+    "config_name_template": os.environ.get("CONFIG_NAME_TEMPLATE", "sLv-{USER}-{INDEX}"),
 }
 LOGIN_FAILED_MAX = int(os.environ.get("LOGIN_FAILED_MAX", 5))
 LOGIN_FAILED_WINDOW = int(os.environ.get("LOGIN_FAILED_WINDOW", 300))
@@ -101,8 +103,14 @@ BOT_I18N = {
         "btn_top": "🔝 Top Users",
         "btn_create": "➕ Create User",
         "btn_addip": "🌐 Add Clean IP",
+        "btn_help": "ℹ️ Help",
+        "btn_cfg": "🛠️ Config",
         "btn_lang": "🇮🇷 فارسی",
         "welcome": "👑 <b>Welcome to sLv Panel Telegram Bot!</b>\nManage your VLESS inbounds directly from your Telegram.",
+        "help_text": "🧭 <b>Available commands</b>\n/start - open the main menu\n/stats - server stats\n/users - list users\n/top - top users\n/create [name] [limit_GB] [days] - create a user\n/test [name] [limit] [unit] [expiry] [expiry_unit] - create a test subscription\n/addaddr [ip_or_domain] - add a clean IP\n/disable [name] - disable a user\n/enable [name] - enable a user\n/reset [name] - reset usage\n/cfg [template] - set the config naming template",
+        "cfg_format": "❌ <b>Invalid format.</b>\nUse: <code>/cfg [template]</code>\nExample: <code>/cfg {IP}-{USER}-{PORT}-{INDEX}</code>",
+        "cfg_success": "✅ <b>Config naming template updated.</b>\nTemplate: <code>{template}</code>",
+        "cfg_guide": "🧩 <b>Config name template placeholders</b>\n\n{INDEX} = config index\n{PORT} = config port\n{USER} = inbound/user name\n{IP} = clean IP address\n\nExample:\n<code>{IP}-{USER}-{PORT}-{INDEX}</code>",
         "lang_switched": "🌐 Language switched to <b>English</b>.",
         "stats": (
             "<b>📊 Server Status Dashboard</b>\n\n"
@@ -197,8 +205,14 @@ BOT_I18N = {
         "btn_top": "🔝 پرمصرف‌ترین‌ها",
         "btn_create": "➕ ساخت کاربر",
         "btn_addip": "🌐 افزودن آی‌پی تمیز",
+        "btn_help": "ℹ️ راهنما",
+        "btn_cfg": "🛠️ قالب",
         "btn_lang": "🇬🇧 English",
         "welcome": "👑 <b>به ربات تلگرامی پنل لافی خوش اومدی!</b>\nاینباندهای VLESS رو مستقیم از تلگرام مدیریت کن.",
+        "help_text": "🧭 <b>دستورات موجود</b>\n/start - باز کردن منوی اصلی\n/stats - آمار سرور\n/users - لیست کاربران\n/top - کاربران برتر\n/create [name] [limit_GB] [days] - ساخت کاربر\n/test [name] [limit] [unit] [expiry] [expiry_unit] - ساخت اشتراک آزمایشی\n/addaddr [ip_or_domain] - افزودن آی‌پی تمیز\n/disable [name] - غیرفعال کردن کاربر\n/enable [name] - فعال کردن کاربر\n/reset [name] - بازنشانی مصرف\n/cfg [template] - تنظیم قالب نام کانفیگ",
+        "cfg_format": "❌ <b>فرمت اشتباه است.</b>\nمثال: <code>/cfg [template]</code>\nمثال: <code>/cfg {IP}-{USER}-{PORT}-{INDEX}</code>",
+        "cfg_success": "✅ <b>قالب نام کانفیگ به‌روزرسانی شد.</b>\nقالب: <code>{template}</code>",
+        "cfg_guide": "🧩 <b>پلاست‌هولدرهای قالب نام کانفیگ</b>\n\n{INDEX} = شماره ردیف کانفیگ\n{PORT} = پورت کانفیگ\n{USER} = نام کاربر\n{IP} = آدرس آی‌پی تمیز\n\nمثال:\n<code>{IP}-{USER}-{PORT}-{INDEX}</code>",
         "lang_switched": "🌐 زبان به <b>فارسی</b> تغییر یافت.",
         "stats": (
             "<b>📊 وضعیت سرور</b>\n\n"
@@ -310,6 +324,8 @@ def build_main_keyboard():
         types.InlineKeyboardButton(L("btn_top"), callback_data="tg_top"),
         types.InlineKeyboardButton(L("btn_create"), callback_data="tg_create_guide"),
         types.InlineKeyboardButton(L("btn_addip"), callback_data="tg_add_ip_guide"),
+        types.InlineKeyboardButton(L("btn_help"), callback_data="tg_help"),
+        types.InlineKeyboardButton(L("btn_cfg"), callback_data="tg_cfg_guide"),
         types.InlineKeyboardButton(L("btn_lang"), callback_data="tg_lang_toggle"),
     )
     return kb
@@ -324,6 +340,7 @@ def save_db():
         "telegram_token": CONFIG["telegram_token"],
         "telegram_admin_id": CONFIG["telegram_admin_id"],
         "bot_lang": CONFIG["bot_lang"],
+        "config_name_template": CONFIG["config_name_template"],
     }
     tmp_path = DB_TMP_FILE
     try:
@@ -366,6 +383,7 @@ def load_db():
         CONFIG["telegram_token"] = data.get("telegram_token", "")
         CONFIG["telegram_admin_id"] = data.get("telegram_admin_id", "")
         CONFIG["bot_lang"] = data.get("bot_lang", "en") if data.get("bot_lang") in ("en", "fa") else "en"
+        CONFIG["config_name_template"] = data.get("config_name_template") or os.environ.get("CONFIG_NAME_TEMPLATE", "sLv-{USER}-{INDEX}")
         restore_admin_password_if_needed()
     except Exception as e:
         logger.error(f"Error loading DB: {e}")
@@ -478,6 +496,23 @@ def get_domain() -> str:
         os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"))
         .replace("https://", "").replace("http://", "")
     )
+
+def build_config_name(link_label: str | None, uid: str, address: str | None = None, port: int | None = None, index: int | None = None) -> str:
+    template = (CONFIG.get("config_name_template") or "sLv-{USER}-{INDEX}").strip() or "sLv-{USER}-{INDEX}"
+    user_value = (link_label or uid or "user").strip() or "user"
+    port_value = port if port is not None else DEFAULT_PORT
+    index_value = index if index is not None else 1
+    ip_value = address or get_domain() or ""
+    values = {
+        "INDEX": str(index_value),
+        "PORT": str(port_value),
+        "USER": user_value,
+        "IP": ip_value,
+    }
+    rendered = re.sub(r"\{([A-Za-z_]+)\}", lambda m: str(values.get(m.group(1).upper(), "")), template)
+    cleaned = re.sub(r"[^A-Za-z0-9._\- ]+", "", rendered).strip().replace(" ", "-")
+    return cleaned or f"sLv-{user_value}-{index_value}"
+
 
 def generate_vless_link(uuid: str, remark: str = "sLv", address: str = None, port: int = None) -> str:
     domain = get_domain()
@@ -662,6 +697,28 @@ async def restart_telegram_bot():
             reply_markup=build_main_keyboard()
         )
 
+    @bot.message_handler(commands=['help'])
+    async def cmd_help(message):
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
+        await bot.send_message(message.chat.id, L("help_text"), parse_mode="HTML", reply_markup=build_main_keyboard())
+
+    @bot.message_handler(commands=['cfg'])
+    async def cmd_cfg(message):
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await bot.send_message(message.chat.id, L("cfg_guide"), parse_mode="HTML", reply_markup=build_main_keyboard())
+            return
+        template = parts[1].strip()
+        if not template:
+            await bot.send_message(message.chat.id, L("cfg_format"), parse_mode="HTML")
+            return
+        CONFIG["config_name_template"] = template
+        save_db()
+        await bot.send_message(message.chat.id, L("cfg_success", template=template), parse_mode="HTML", reply_markup=build_main_keyboard())
+
     @bot.message_handler(commands=['stats'])
     async def cmd_stats(message):
         if not _is_admin_chat(message.chat.id, admin_id):
@@ -749,6 +806,10 @@ async def restart_telegram_bot():
             await bot.send_message(call.message.chat.id, L("create_guide"), parse_mode="HTML", reply_markup=build_main_keyboard())
         elif call.data == "tg_add_ip_guide":
             await bot.send_message(call.message.chat.id, L("addip_guide"), parse_mode="HTML", reply_markup=build_main_keyboard())
+        elif call.data == "tg_help":
+            await bot.send_message(call.message.chat.id, L("help_text"), parse_mode="HTML", reply_markup=build_main_keyboard())
+        elif call.data == "tg_cfg_guide":
+            await bot.send_message(call.message.chat.id, L("cfg_guide"), parse_mode="HTML", reply_markup=build_main_keyboard())
 
     async def _run_polling(bot_instance):
         try:
@@ -899,7 +960,7 @@ async def handle_create_command(text: str):
         }
 
     save_db()
-    vless_link = generate_vless_link(uid, remark=f"sLv-{label}", port=DEFAULT_PORT)
+    vless_link = generate_vless_link(uid, remark=build_config_name(label, uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT)
     sub_url = f"https://{get_domain()}/sub/{uid}"
 
     quota_str = _fmt_bytes(limit_bytes) if limit_bytes > 0 else L("unlimited")
@@ -953,7 +1014,7 @@ async def handle_test_command(text: str):
             "expires_at": expires_at,
         }
     save_db()
-    vless_link = generate_vless_link(uid, remark=f"sLv-{uid}", port=DEFAULT_PORT)
+    vless_link = generate_vless_link(uid, remark=build_config_name(uid, uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT)
     sub_url = f"https://{get_domain()}/sub/{uid}"
     quota_str = _fmt_bytes(limit_bytes) if limit_bytes > 0 else L("unlimited")
     expiry_label = f"{int(expiry_value)} {expiry_unit}"
@@ -1140,7 +1201,8 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 async def get_settings(_=Depends(require_auth)):
     return {
         "telegram_token": CONFIG["telegram_token"],
-        "telegram_admin_id": CONFIG["telegram_admin_id"]
+        "telegram_admin_id": CONFIG["telegram_admin_id"],
+        "config_name_template": CONFIG.get("config_name_template", "sLv-{USER}-{INDEX}"),
     }
 
 @app.post("/api/settings")
@@ -1148,6 +1210,11 @@ async def update_settings(request: Request, _=Depends(require_auth)):
     body = await request.json()
     CONFIG["telegram_token"] = body.get("telegram_token", "").strip()
     CONFIG["telegram_admin_id"] = body.get("telegram_admin_id", "").strip()
+    template_value = (body.get("config_name_template") or "").strip()
+    if template_value:
+        CONFIG["config_name_template"] = template_value
+    else:
+        CONFIG["config_name_template"] = "sLv-{USER}-{INDEX}"
     save_db()
     await restart_telegram_bot()
     return {"ok": True}
@@ -1191,6 +1258,9 @@ async def create_link(request: Request, _=Depends(require_auth)):
     max_conn = int(body.get("max_connections") or 0)
     if max_conn < 0:
         max_conn = 0
+    clean_ip_count = int(body.get("clean_ip_count") or 0)
+    if clean_ip_count < 0:
+        clean_ip_count = 0
     expiry_value = body.get("expiry_value")
     expiry_unit = (body.get("expiry_unit") or "days").lower()
     expires_at: str | None = None
@@ -1201,19 +1271,26 @@ async def create_link(request: Request, _=Depends(require_auth)):
     except (ValueError, TypeError):
         pass
     uid = label
+    link_data = {
+        "label": label,
+        "limit_bytes": limit_bytes,
+        "used_bytes": 0,
+        "daily_limit_bytes": daily_limit_bytes,
+        "daily_used_bytes": 0,
+        "daily_usage_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "max_connections": max_conn,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "active": True,
+        "expires_at": expires_at,
+    }
+    if clean_ip_count > 0:
+        async with CUSTOM_ADDRESSES_LOCK:
+            available_addresses = list(CUSTOM_ADDRESSES)
+        if available_addresses:
+            selected_addresses = random.sample(available_addresses, k=min(clean_ip_count, len(available_addresses)))
+            link_data["clean_ip_addresses"] = selected_addresses
     async with LINKS_LOCK:
-        LINKS[uid] = {
-            "label": label,
-            "limit_bytes": limit_bytes,
-            "used_bytes": 0,
-            "daily_limit_bytes": daily_limit_bytes,
-            "daily_used_bytes": 0,
-            "daily_usage_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "max_connections": max_conn,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "active": True,
-            "expires_at": expires_at,
-        }
+        LINKS[uid] = link_data
     save_db()
     return {
         "uuid": uid,
@@ -1226,7 +1303,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "active": True,
         "created_at": LINKS[uid]["created_at"],
         "expires_at": expires_at,
-        "vless_link": generate_vless_link(uid, remark=f"sLv-{label}", port=DEFAULT_PORT),
+        "vless_link": generate_vless_link(uid, remark=build_config_name(label, uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT),
     }
 
 @app.get("/api/links")
@@ -1247,7 +1324,7 @@ async def list_links(_=Depends(require_auth)):
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"sLv-{data['label']}", port=DEFAULT_PORT),
+            "vless_link": generate_vless_link(uid, remark=build_config_name(data.get('label'), uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -1299,6 +1376,31 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     save_db()
     await close_connections_for_link(uid)
     return {"ok": True}
+
+@app.post("/api/addresses/import")
+async def import_addresses_from_file(_=Depends(require_auth)):
+    file_path = os.path.join(os.path.dirname(__file__), "ips.txt")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="ips.txt not found")
+
+    imported_addresses = []
+    with open(file_path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            addr = raw_line.strip()
+            if not addr:
+                continue
+            if not re.match(r'^[a-zA-Z0-9\-_. ]+$', addr):
+                continue
+            imported_addresses.append(addr)
+
+    async with CUSTOM_ADDRESSES_LOCK:
+        existing = set(CUSTOM_ADDRESSES)
+        new_addresses = [addr for addr in imported_addresses if addr not in existing]
+        for addr in new_addresses:
+            CUSTOM_ADDRESSES.append(addr)
+
+    save_db()
+    return {"ok": True, "added": len(new_addresses), "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
@@ -1388,9 +1490,9 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
         hours = (secs_left % 86400) // 3600
         expiry_str = f"{days} Days, {hours} Hours Left"
 
-    configs = [generate_vless_link(uid, remark=f"sLv-{link['label']}", port=DEFAULT_PORT)]
+    configs = [generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT)]
     for i, addr in enumerate(addresses):
-        configs.append(generate_vless_link(uid, remark=f"sLv-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
+        configs.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, DEFAULT_PORT, i + 1), address=addr, port=DEFAULT_PORT))
 
     configs_json = json.dumps(configs)
 
@@ -1588,9 +1690,9 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
     status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0", port=DEFAULT_PORT)
     links_out = [status_node]
     
-    links_out.append(generate_vless_link(uid, remark=f"sLv-{link['label']}", port=DEFAULT_PORT))
+    links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT))
     for i, addr in enumerate(addresses):
-        links_out.append(generate_vless_link(uid, remark=f"sLv-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
+        links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, DEFAULT_PORT, i + 1), address=addr, port=DEFAULT_PORT))
             
     return "\n".join(links_out)
 
@@ -1609,8 +1711,11 @@ async def subscription_endpoint(uid: str, request: Request):
     if expires_at is not None and expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=403, detail="link expired")
 
-    async with CUSTOM_ADDRESSES_LOCK:
-        addresses = list(CUSTOM_ADDRESSES)
+    if "clean_ip_addresses" in link:
+        addresses = list(link["clean_ip_addresses"])
+    else:
+        async with CUSTOM_ADDRESSES_LOCK:
+            addresses = list(CUSTOM_ADDRESSES)
 
     ua = request.headers.get("user-agent", "").lower()
     accept = request.headers.get("accept", "").lower()
@@ -2167,9 +2272,9 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
         <span class="nav-label" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
       </button>
-      <button class="nav-item" data-page="security">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-        <span class="nav-label" data-en="Security" data-fa="امنیت">Security</span>
+      <button class="nav-item" data-page="settings">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m10.5 2 1.1 3.3a2.2 2.2 0 0 0 1.7 1.5l3.4.5-2.4 2.3a2.2 2.2 0 0 0-.6 1.9l.6 3.4-3.1-1.6a2.2 2.2 0 0 0-2.1 0l-3.1 1.6.6-3.4a2.2 2.2 0 0 0-.6-1.9L4.3 7.3l3.4-.5a2.2 2.2 0 0 0 1.7-1.5L10.5 2Z"/><path d="M19 15a4 4 0 1 1 0-8 4 4 0 0 1 0 8Z"/></svg>
+        <span class="nav-label" data-en="Settings" data-fa="تنظیمات">Settings</span>
       </button>
       <button class="nav-item logout-mob" onclick="doLogout()">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -2298,20 +2403,31 @@ body[dir="rtl"]{direction:rtl;text-align:right}
           <button class="btn btn-gold" onclick="showAddAddrMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
         </div>
       </div>
+      <div class="card" style="margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+          <div>
+            <div style="font-size:13px;color:var(--text2);font-weight:600" data-en="Note" data-fa="نکته">Note</div>
+            <div style="font-size:12px;color:var(--text3);margin-top:4px;line-height:1.6" data-en="For clean IPs, use the internal IPs from the project." data-fa="برای آی‌پی‌های تمیز از آی‌پی‌های داخلی پروژه استفاده کنید">برای آی‌پی‌های تمیز از آی‌پی‌های داخلی پروژه استفاده کنید</div>
+          </div>
+          <button class="btn btn-gold" onclick="importIpsFile()" data-en="Add IPs" data-fa="افزودن ای پی ها">افزودن ای پی ها</button>
+        </div>
+      </div>
       <div class="card">
         <div style="font-size:12px;color:var(--text3);margin-bottom:12px" data-en="Default: www.speedtest.net" data-fa="پیش‌فرض: www.speedtest.net">Default: www.speedtest.net</div>
         <div id="addr-list"></div>
       </div>
     </section>
 
-    <!-- Security & Settings -->
-    <section class="page" id="page-security">
-      <div class="page-header"><div><div class="page-title" data-en="Security & Settings" data-fa="امنیت و تنظیمات">Security & Settings</div><div class="page-sub" data-en="Settings, Password & Live logs" data-fa="تنظیمات، تغییر رمز پنل و لاگ‌های زنده">Settings, Password & Live logs</div></div></div>
+    <!-- Settings -->
+    <section class="page" id="page-settings">
+      <div class="page-header"><div><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div><div class="page-sub" data-en="Bot, naming template & password" data-fa="ربات، قالب نام‌گذاری و رمز عبور">Bot, naming template & password</div></div></div>
       <div class="grid-2">
         <div class="card">
           <div class="card-hd"><div class="card-title" data-en="Telegram Bot Settings" data-fa="تنظیمات ربات تلگرام">Telegram Bot Settings</div></div>
           <div class="fg"><label class="fl" data-en="Telegram Bot Token" data-fa="توکن ربات تلگرام">Bot Token</label><input class="fi" type="text" id="tg-token" placeholder="123456:ABC-DEF..."></div>
           <div class="fg"><label class="fl" data-en="Telegram Admin ID" data-fa="شناسه عددی ادمین">Admin Chat ID</label><input class="fi" type="text" id="tg-admin-id" placeholder="987654321"></div>
+          <div class="fg"><label class="fl" data-en="Config Name Template" data-fa="قالب نام کانفیگ">Config Name Template</label><input class="fi" type="text" id="cfg-template" placeholder="{IP}-{USER}-{PORT}-{INDEX}"></div>
+          <div style="font-size:12px;color:var(--text3);margin-top:6px;line-height:1.5" data-en="Use: {INDEX}, {PORT}, {USER}, {IP}" data-fa="از: {INDEX}، {PORT}، {USER}، {IP}">Use: {INDEX}, {PORT}, {USER}, {IP}</div>
           <button class="btn btn-gold" onclick="saveSettings()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Save Bot Settings" data-fa="ذخیره تنظیمات ربات">Save Bot Settings</button>
         </div>
         <div class="card">
@@ -2349,6 +2465,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="fg" style="max-width:120px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu2"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></div>
     </div>
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl" data-en="Clean IP Count" data-fa="تعداد آی‌پی تمیز">Clean IP Count</label><input class="fi" id="ncip" type="number" min="0" data-ph-en="0 = none" data-ph-fa="۰ = بدون انتخاب" placeholder="0 = none"></div>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
   </div>
 </div>
@@ -2745,6 +2862,7 @@ async function createLink(){
   const expiryValue=parseFloat($m('ne').value)||0;
   const expiryUnit=$m('nu2').value||'days';
   const mc=parseInt($m('nc').value)||0;
+  const cleanIpCount=parseInt($m('ncip').value)||0;
   try{
     const r=await fetch('/api/links',{
       method:'POST',
@@ -2757,12 +2875,13 @@ async function createLink(){
         daily_limit_unit:dailyUnit,
         expiry_value:expiryValue,
         expiry_unit:expiryUnit,
-        max_connections:mc
+        max_connections:mc,
+        clean_ip_count:cleanIpCount
       })
     });
     if(!r.ok)throw new Error();
     toast('Created');
-    $m('nl').value='';$m('nv').value='';$m('ndv').value='';$m('nc').value='';$m('ne').value='';
+    $m('nl').value='';$m('nv').value='';$m('ndv').value='';$m('nc').value='';$m('ncip').value='';$m('ne').value='';
     $m('mo-add').classList.remove('show');
     await loadLinks();
     await loadStats();
@@ -2890,6 +3009,7 @@ async function loadSettings(){
       const d = await r.json();
       $m('tg-token').value = d.telegram_token || '';
       $m('tg-admin-id').value = d.telegram_admin_id || '';
+      $m('cfg-template').value = d.config_name_template || '{IP}-{USER}-{PORT}-{INDEX}';
     }
   } catch(e){}
 }
@@ -2897,11 +3017,12 @@ async function loadSettings(){
 async function saveSettings(){
   const tok = $m('tg-token').value.trim();
   const adm = $m('tg-admin-id').value.trim();
+  const cfg = $m('cfg-template').value.trim() || '{IP}-{USER}-{PORT}-{INDEX}';
   try {
     const r = await fetch('/api/settings', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({telegram_token: tok, telegram_admin_id: adm})
+      body: JSON.stringify({telegram_token: tok, telegram_admin_id: adm, config_name_template: cfg})
     });
     if (r.ok) {
       toast('Bot settings saved & restarted');
@@ -3066,6 +3187,16 @@ function renderAddrs(){
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
 
+async function importIpsFile(){
+  try{
+    const r=await fetch('/api/addresses/import',{method:'POST'});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(d.detail||'Failed');
+    toast(d.added ? 'Added '+d.added : 'No new IPs added');
+    await loadAddrs();
+  }catch(e){toast('Error importing IPs',true);}
+}
+
 async function addAddrs(){
   const lines=($m('na').value||'').trim().split('\n').map(l=>l.trim()).filter(l=>l);
   let ok=0,fail=0;
@@ -3133,4 +3264,4 @@ async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0+", port=CONFIG["port"])
+    uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
