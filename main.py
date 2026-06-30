@@ -8,15 +8,12 @@ import time
 import re
 import random
 import base64
-import socket
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
-import uuid
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import Response, HTMLResponse, JSONResponse , RedirectResponse
+from fastapi.responses import Response, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
@@ -51,16 +48,9 @@ logger.addHandler(q_handler)
 logging.getLogger("uvicorn.error").addHandler(q_handler)
 logging.getLogger("uvicorn.access").addHandler(q_handler)
 
+app = FastAPI(title="sLv Panel", docs_url=None, redoc_url=None)
+
 DEFAULT_SECRET = os.environ.get("SECRET_KEY") or os.environ.get("APP_SECRET") or "sLv-panel-default-secret"
-AVAILABLE_CONFIG_PORTS = [443, 2053, 2083, 2087, 2096, 8443, 80, 8080, 8880, 2052, 2082, 2086, 2095]
-
-def normalize_config_port(value):
-    try:
-        port = int(value)
-    except (TypeError, ValueError):
-        return 443
-    return port if port in AVAILABLE_CONFIG_PORTS else 443
-
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY") or os.environ.get("APP_SECRET") or DEFAULT_SECRET,
@@ -69,11 +59,12 @@ CONFIG = {
     "bot_lang": "en",
     "cookie_secure": os.environ.get("COOKIE_SECURE", "auto").lower(),
     "config_name_template": os.environ.get("CONFIG_NAME_TEMPLATE", "sLv-{USER}-{INDEX}"),
-    "config_port": normalize_config_port(os.environ.get("CONFIG_PORT", 443)),
 }
 LOGIN_FAILED_MAX = int(os.environ.get("LOGIN_FAILED_MAX", 5))
 LOGIN_FAILED_WINDOW = int(os.environ.get("LOGIN_FAILED_WINDOW", 300))
 LOGIN_ATTEMPTS: dict = {}
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 connections: dict = {}
 connections_lock = asyncio.Lock()
@@ -89,7 +80,6 @@ LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
-bot_wizard_state: dict = {}
 
 notified_uids = set()
 
@@ -101,6 +91,7 @@ DEFAULT_PORT = 443
 DB_FILE = "panel_db.json"
 DB_BACKUP_FILE = "panel_db.json.bak"
 DB_TMP_FILE = "panel_db.json.tmp"
+APP_VERSION = "1.1.0"
 bot = None
 bot_polling_task: asyncio.Task | None = None
 
@@ -113,9 +104,13 @@ BOT_I18N = {
         "btn_create": "➕ Create User",
         "btn_addip": "🌐 Add Clean IP",
         "btn_help": "ℹ️ Help",
+        "btn_cfg": "🛠️ Config",
         "btn_lang": "🇮🇷 فارسی",
-        "welcome": "👑 <b>Welcome to sLv Panel Telegram Bot!</b>\nManage your VLESS & Trojan inbounds directly from your Telegram.",
-        "help_text": "🧭 <b>Available commands</b>\n/start - open the main menu\n/stats - server stats\n/users - list users\n/top - top users\n/create - create a user (Interactive)\n/addaddr - add a clean IP\n/disable [name] - disable a user\n/enable [name] - enable a user\n/reset [name] - reset usage\n/cancel - cancel current operation",
+        "welcome": "👑 <b>Welcome to sLv Panel Telegram Bot!</b>\nManage your VLESS inbounds directly from your Telegram.",
+        "help_text": "🧭 <b>Available commands</b>\n/start - open the main menu\n/stats - server stats\n/users - list users\n/top - top users\n/create [name] [limit_GB] [days] - create a user\n/test [name] [limit] [unit] [expiry] [expiry_unit] - create a test subscription\n/addaddr [ip_or_domain] - add a clean IP\n/disable [name] - disable a user\n/enable [name] - enable a user\n/reset [name] - reset usage\n/cfg [template] - set the config naming template",
+        "cfg_format": "❌ <b>Invalid format.</b>\nUse: <code>/cfg [template]</code>\nExample: <code>/cfg {IP}-{USER}-{PORT}-{INDEX}</code>",
+        "cfg_success": "✅ <b>Config naming template updated.</b>\nTemplate: <code>{template}</code>",
+        "cfg_guide": "🧩 <b>Config name template placeholders</b>\n\n{INDEX} = config index\n{PORT} = config port\n{USER} = inbound/user name\n{IP} = clean IP address\n\nExample:\n<code>{IP}-{USER}-{PORT}-{INDEX}</code>",
         "lang_switched": "🌐 Language switched to <b>English</b>.",
         "stats": (
             "<b>📊 Server Status Dashboard</b>\n\n"
@@ -134,26 +129,27 @@ BOT_I18N = {
         "status_off": "🔴 Off",
         "top_title": "<b>🔝 Top 5 Users by Usage:</b>\n",
         "top_line": "{i}. <b>{label}</b>: Used {used} of {limit}",
-        "wiz_name": "👤 <b>Enter the username:</b>\n<i>(Only English letters and numbers)</i>",
-        "wiz_limit": "📊 <b>Enter traffic limit in GB:</b>\n<i>(Send 0 for unlimited)</i>",
-        "wiz_days": "⌛ <b>Enter validity in days:</b>\n<i>(Send 0 for no expiry)</i>",
-        "wiz_proto": "🔌 <b>Select the allowed protocols:</b>",
-        "wiz_cancel": "🚫 Operation cancelled.",
-        "create_bad_name": "❌ <b>Invalid name.</b> Please use only letters and numbers. Try again:",
-        "create_bad_num": "❌ <b>Invalid number.</b> Please enter a valid number. Try again:",
-        "create_exists": "❌ <b>User '{label}' already exists.</b> Try a different name:",
+        "create_format": (
+            "❌ <b>Invalid format.</b>\n"
+            "Format: <code>/create [name] [limit_GB] [days]</code>\n"
+            "Example: <code>/create Ali 15 30</code>"
+        ),
+        "create_bad_name": "❌ <b>Name must contain only English letters and numbers.</b>",
+        "create_bad_limit": "❌ <b>Traffic limit must be a number.</b>",
+        "create_bad_days": "❌ <b>Days valid must be an integer.</b>",
+        "create_exists": "❌ <b>An inbound with the name '{label}' already exists.</b>",
         "create_success": (
             "✅ <b>Inbound Created Successfully!</b>\n\n"
             "👤 <b>Name:</b> <code>{label}</code>\n"
             "📊 <b>Quota:</b> <code>{quota}</code>\n"
-            "⌛ <b>Expiry:</b> <code>{expiry}</code>\n"
-            "🔌 <b>Protocols:</b> <code>{protocols}</code>\n\n"
-            "🌐 <b>Subscription URL (Contains all links):</b>\n<code>{sub}</code>"
+            "⌛ <b>Expiry:</b> <code>{expiry}</code>\n\n"
+            "🔗 <b>VLESS Link:</b>\n<code>{vless}</code>\n\n"
+            "🌐 <b>Subscription URL:</b>\n<code>{sub}</code>"
         ),
         "unlimited": "Unlimited",
         "days_fmt": "{days} days",
-        "addaddr_guide": "🌐 <b>Send the Clean IP or Domain to add:</b>\n<i>(e.g. 1.1.1.1 or cf.example.com)</i>",
-        "addaddr_invalid": "❌ Invalid address format. Operation cancelled.",
+        "addaddr_format": "❌ Format: <code>/addaddr [ip_or_domain]</code>",
+        "addaddr_invalid": "❌ Invalid address format.",
         "addaddr_exists": "⚠️ Address '{addr}' is already in the list.",
         "addaddr_success": "✅ Clean IP/Domain <code>{addr}</code> successfully added.",
         "toggle_format": "❌ Format: <code>/{action} [username]</code>",
@@ -163,6 +159,35 @@ BOT_I18N = {
         "state_disabled": "Disabled",
         "reset_format": "❌ Format: <code>/reset [username]</code>",
         "reset_success": "🔄 Usage reset to 0 for user <code>{name}</code>.",
+        "create_guide": (
+            "➕ <b>How to create a user:</b>\n\n"
+            "Use the <code>/create</code> command. Format:\n"
+            "<code>/create [name] [limit_GB] [days]</code>\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/create Ali 15 30</code> (15GB limit, 30 days validity)\n"
+            "• <code>/create Reza 0 0</code> (Unlimited, No Expiry)"
+        ),
+        "test_format": (
+            "❌ <b>Invalid format.</b>\n"
+            "Format: <code>/test [name] [limit] [unit] [expiry] [expiry_unit]</code>\n"
+            "Example: <code>/test Demo 100 MB 2 hours</code>"
+        ),
+        "test_success": (
+            "✅ <b>Test subscription created!</b>\n\n"
+            "👤 <b>Name:</b> <code>{label}</code>\n"
+            "📊 <b>Quota:</b> <code>{quota}</code>\n"
+            "⌛ <b>Expiry:</b> <code>{expiry}</code>\n\n"
+            "🔗 <b>VLESS Link:</b>\n<code>{vless}</code>\n\n"
+            "🌐 <b>Subscription URL:</b>\n<code>{sub}</code>"
+        ),
+        "addip_guide": (
+            "🌐 <b>How to add Clean IP:</b>\n\n"
+            "Use the <code>/addaddr</code> command. Format:\n"
+            "<code>/addaddr [ip_or_domain]</code>\n\n"
+            "<b>Example:</b>\n"
+            "• <code>/addaddr cf.example.com</code>\n"
+            "• <code>/addaddr 1.1.1.1</code>"
+        ),
         "quota_alert": (
             "⚠️ <b>Quota Alert!</b>\n"
             "User: <code>{label}</code> has reached their limit.\n"
@@ -181,9 +206,13 @@ BOT_I18N = {
         "btn_create": "➕ ساخت کاربر",
         "btn_addip": "🌐 افزودن آی‌پی تمیز",
         "btn_help": "ℹ️ راهنما",
+        "btn_cfg": "🛠️ قالب",
         "btn_lang": "🇬🇧 English",
-        "welcome": "👑 <b>به ربات تلگرامی پنل لافی خوش اومدی!</b>\nاینباندهای VLESS و Trojan رو مستقیم از تلگرام مدیریت کن.",
-        "help_text": "🧭 <b>دستورات موجود</b>\n/start - باز کردن منوی اصلی\n/stats - آمار سرور\n/users - لیست کاربران\n/top - کاربران برتر\n/create - ساخت کاربر جدید (تعاملی)\n/addaddr - افزودن آی‌پی تمیز\n/disable [name] - غیرفعال کردن کاربر\n/enable [name] - فعال کردن کاربر\n/reset [name] - بازنشانی مصرف\n/cancel - لغو عملیات فعلی",
+        "welcome": "👑 <b>به ربات تلگرامی پنل لافی خوش اومدی!</b>\nاینباندهای VLESS رو مستقیم از تلگرام مدیریت کن.",
+        "help_text": "🧭 <b>دستورات موجود</b>\n/start - باز کردن منوی اصلی\n/stats - آمار سرور\n/users - لیست کاربران\n/top - کاربران برتر\n/create [name] [limit_GB] [days] - ساخت کاربر\n/test [name] [limit] [unit] [expiry] [expiry_unit] - ساخت اشتراک آزمایشی\n/addaddr [ip_or_domain] - افزودن آی‌پی تمیز\n/disable [name] - غیرفعال کردن کاربر\n/enable [name] - فعال کردن کاربر\n/reset [name] - بازنشانی مصرف\n/cfg [template] - تنظیم قالب نام کانفیگ",
+        "cfg_format": "❌ <b>فرمت اشتباه است.</b>\nمثال: <code>/cfg [template]</code>\nمثال: <code>/cfg {IP}-{USER}-{PORT}-{INDEX}</code>",
+        "cfg_success": "✅ <b>قالب نام کانفیگ به‌روزرسانی شد.</b>\nقالب: <code>{template}</code>",
+        "cfg_guide": "🧩 <b>پلاست‌هولدرهای قالب نام کانفیگ</b>\n\n{INDEX} = شماره ردیف کانفیگ\n{PORT} = پورت کانفیگ\n{USER} = نام کاربر\n{IP} = آدرس آی‌پی تمیز\n\nمثال:\n<code>{IP}-{USER}-{PORT}-{INDEX}</code>",
         "lang_switched": "🌐 زبان به <b>فارسی</b> تغییر یافت.",
         "stats": (
             "<b>📊 وضعیت سرور</b>\n\n"
@@ -202,26 +231,27 @@ BOT_I18N = {
         "status_off": "🔴 غیرفعال",
         "top_title": "<b>🔝 ۵ کاربر پرمصرف:</b>\n",
         "top_line": "{i}. <b>{label}</b>: مصرف {used} از {limit}",
-        "wiz_name": "👤 <b>نام کاربر را وارد کنید:</b>\n<i>(فقط حروف انگلیسی و عدد مجاز است)</i>",
-        "wiz_limit": "📊 <b>محدودیت حجم (گیگابایت) را وارد کنید:</b>\n<i>(برای نامحدود عدد 0 را بفرستید)</i>",
-        "wiz_days": "⌛ <b>تعداد روز اعتبار را وارد کنید:</b>\n<i>(برای بدون انقضا عدد 0 را بفرستید)</i>",
-        "wiz_proto": "🔌 <b>پروتکل‌های مجاز را انتخاب کنید:</b>",
-        "wiz_cancel": "🚫 عملیات لغو شد.",
-        "create_bad_name": "❌ <b>نام نامعتبر است.</b> لطفاً فقط از حروف انگلیسی و اعداد استفاده کنید. دوباره امتحان کنید:",
-        "create_bad_num": "❌ <b>عدد نامعتبر است.</b> لطفاً یک عدد صحیح بفرستید. دوباره امتحان کنید:",
-        "create_exists": "❌ <b>کاربری با نام «{label}» از قبل وجود دارد.</b> یک نام دیگر بفرستید:",
+        "create_format": (
+            "❌ <b>فرمت اشتباه است.</b>\n"
+            "فرمت: <code>/create [نام] [حجم_GB] [روز]</code>\n"
+            "مثال: <code>/create Ali 15 30</code>"
+        ),
+        "create_bad_name": "❌ <b>نام فقط باید شامل حروف انگلیسی و عدد باشد.</b>",
+        "create_bad_limit": "❌ <b>حجم ترافیک باید عدد باشد.</b>",
+        "create_bad_days": "❌ <b>تعداد روز باید عدد صحیح باشد.</b>",
+        "create_exists": "❌ <b>کاربری با نام «{label}» از قبل وجود دارد.</b>",
         "create_success": (
             "✅ <b>کاربر با موفقیت ساخته شد!</b>\n\n"
             "👤 <b>نام:</b> <code>{label}</code>\n"
             "📊 <b>حجم:</b> <code>{quota}</code>\n"
-            "⌛ <b>انقضا:</b> <code>{expiry}</code>\n"
-            "🔌 <b>پروتکل‌ها:</b> <code>{protocols}</code>\n\n"
-            "🌐 <b>لینک اشتراک (شامل همه کانفیگ‌ها):</b>\n<code>{sub}</code>"
+            "⌛ <b>انقضا:</b> <code>{expiry}</code>\n\n"
+            "🔗 <b>لینک VLESS:</b>\n<code>{vless}</code>\n\n"
+            "🌐 <b>آدرس اشتراک:</b>\n<code>{sub}</code>"
         ),
         "unlimited": "نامحدود",
         "days_fmt": "{days} روز",
-        "addaddr_guide": "🌐 <b>آدرس آی‌پی تمیز یا دامنه را بفرستید:</b>\n<i>(مثال: 1.1.1.1 یا cf.example.com)</i>",
-        "addaddr_invalid": "❌ فرمت آدرس نامعتبر است. عملیات لغو شد.",
+        "addaddr_format": "❌ فرمت: <code>/addaddr [آی‌پی_یا_دامنه]</code>",
+        "addaddr_invalid": "❌ فرمت آدرس نامعتبر است.",
         "addaddr_exists": "⚠️ آدرس «{addr}» قبلاً در لیست موجود است.",
         "addaddr_success": "✅ آی‌پی/دامنه‌ی <code>{addr}</code> با موفقیت اضافه شد.",
         "toggle_format": "❌ فرمت: <code>/{action} [نام‌کاربری]</code>",
@@ -231,6 +261,35 @@ BOT_I18N = {
         "state_disabled": "غیرفعال",
         "reset_format": "❌ فرمت: <code>/reset [نام‌کاربری]</code>",
         "reset_success": "🔄 مصرف کاربر <code>{name}</code> به صفر بازنشانی شد.",
+        "create_guide": (
+            "➕ <b>راهنمای ساخت کاربر:</b>\n\n"
+            "از دستور <code>/create</code> استفاده کن. فرمت:\n"
+            "<code>/create [نام] [حجم_GB] [روز]</code>\n\n"
+            "<b>مثال‌ها:</b>\n"
+            "• <code>/create Ali 15 30</code> (۱۵ گیگ، ۳۰ روز اعتبار)\n"
+            "• <code>/create Reza 0 0</code> (نامحدود، بدون انقضا)"
+        ),
+        "test_format": (
+            "❌ <b>فرمت اشتباه است.</b>\n"
+            "فرمت: <code>/test [نام] [حجم] [واحد] [انقضا] [واحد_انقضا]</code>\n"
+            "مثال: <code>/test Demo 100 MB 2 hours</code>"
+        ),
+        "test_success": (
+            "✅ <b>اشتراک آزمایشی ساخته شد!</b>\n\n"
+            "👤 <b>نام:</b> <code>{label}</code>\n"
+            "📊 <b>حجم:</b> <code>{quota}</code>\n"
+            "⌛ <b>انقضا:</b> <code>{expiry}</code>\n\n"
+            "🔗 <b>لینک VLESS:</b>\n<code>{vless}</code>\n\n"
+            "🌐 <b>آدرس اشتراک:</b>\n<code>{sub}</code>"
+        ),
+        "addip_guide": (
+            "🌐 <b>راهنمای افزودن آی‌پی تمیز:</b>\n\n"
+            "از دستور <code>/addaddr</code> استفاده کن. فرمت:\n"
+            "<code>/addaddr [آی‌پی_یا_دامنه]</code>\n\n"
+            "<b>مثال:</b>\n"
+            "• <code>/addaddr cf.example.com</code>\n"
+            "• <code>/addaddr 1.1.1.1</code>"
+        ),
         "quota_alert": (
             "⚠️ <b>هشدار اتمام حجم!</b>\n"
             "کاربر: <code>{label}</code> به سقف مصرف رسید.\n"
@@ -266,18 +325,8 @@ def build_main_keyboard():
         types.InlineKeyboardButton(L("btn_create"), callback_data="tg_create_guide"),
         types.InlineKeyboardButton(L("btn_addip"), callback_data="tg_add_ip_guide"),
         types.InlineKeyboardButton(L("btn_help"), callback_data="tg_help"),
+        types.InlineKeyboardButton(L("btn_cfg"), callback_data="tg_cfg_guide"),
         types.InlineKeyboardButton(L("btn_lang"), callback_data="tg_lang_toggle"),
-    )
-    return kb
-
-def build_protocol_keyboard(chat_id):
-    if not TELEBOT_AVAILABLE:
-        return None
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("VLESS & Trojan ⚡", callback_data=f"proto_both_{chat_id}"),
-        types.InlineKeyboardButton("VLESS Only", callback_data=f"proto_vless_{chat_id}"),
-        types.InlineKeyboardButton("Trojan Only", callback_data=f"proto_trojan_{chat_id}")
     )
     return kb
 
@@ -292,7 +341,6 @@ def save_db():
         "telegram_admin_id": CONFIG["telegram_admin_id"],
         "bot_lang": CONFIG["bot_lang"],
         "config_name_template": CONFIG["config_name_template"],
-        "config_port": CONFIG.get("config_port", 443),
     }
     tmp_path = DB_TMP_FILE
     try:
@@ -330,22 +378,12 @@ def load_db():
         AUTH["password_hash"] = data.get("auth_hash", AUTH["password_hash"])
         LINKS.clear()
         LINKS.update(data.get("links", {}))
-        for uid, link_data in list(LINKS.items()):
-            if isinstance(link_data, dict):
-                if "uuid" not in link_data:
-                    link_data["uuid"] = uid
-                elif link_data.get("uuid") != uid:
-                    link_data["uuid"] = uid
-                # Migrate to multi-protocol
-                if "protocols" not in link_data:
-                    link_data["protocols"] = ["vless", "trojan"]
         CUSTOM_ADDRESSES.clear()
         CUSTOM_ADDRESSES.extend(data.get("custom_addresses", ["www.speedtest.net"]))
         CONFIG["telegram_token"] = data.get("telegram_token", "")
         CONFIG["telegram_admin_id"] = data.get("telegram_admin_id", "")
         CONFIG["bot_lang"] = data.get("bot_lang", "en") if data.get("bot_lang") in ("en", "fa") else "en"
         CONFIG["config_name_template"] = data.get("config_name_template") or os.environ.get("CONFIG_NAME_TEMPLATE", "sLv-{USER}-{INDEX}")
-        CONFIG["config_port"] = normalize_config_port(data.get("config_port", CONFIG.get("config_port", 443)))
         restore_admin_password_if_needed()
     except Exception as e:
         logger.error(f"Error loading DB: {e}")
@@ -355,6 +393,7 @@ def hash_password(pw: str, secret: str | None = None) -> str:
     used_secret = secret or CONFIG.get("secret") or DEFAULT_SECRET
     return hashlib.sha256(f"{pw}{used_secret}".encode()).hexdigest()
 
+
 def get_secret_candidates() -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
@@ -363,6 +402,7 @@ def get_secret_candidates() -> list[str]:
             candidates.append(secret)
             seen.add(secret)
     return candidates
+
 
 def password_matches(pw: str) -> bool:
     target = str(pw or "")
@@ -377,6 +417,7 @@ def password_matches(pw: str) -> bool:
             return True
     return False
 
+
 def restore_admin_password_if_needed() -> None:
     env_admin_pw = os.environ.get("ADMIN_PASSWORD")
     if env_admin_pw:
@@ -386,6 +427,7 @@ def restore_admin_password_if_needed() -> None:
         return
     AUTH["password_hash"] = hash_password("admin")
     save_db()
+
 
 AUTH = {"password_hash": hash_password("admin")}
 SESSIONS: dict = {}
@@ -430,8 +472,8 @@ async def keep_alive():
         except Exception:
             pass
 
-@asynccontextmanager
-async def lifespan_handler(app: FastAPI):
+@app.on_event("startup")
+async def startup():
     global http_client
     load_db()
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
@@ -441,15 +483,12 @@ async def lifespan_handler(app: FastAPI):
     await restart_telegram_bot()
     asyncio.create_task(telegram_notifier_cron())
     await ensure_default_link()
-    
-    yield
-    
+
+@app.on_event("shutdown")
+async def shutdown():
     await _stop_telegram_bot()
     if http_client:
         await http_client.aclose()
-
-app = FastAPI(title="sLv Panel", docs_url=None, redoc_url=None, lifespan=lifespan_handler)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_domain() -> str:
@@ -474,6 +513,7 @@ def build_config_name(link_label: str | None, uid: str, address: str | None = No
     cleaned = re.sub(r"[^A-Za-z0-9._\- ]+", "", rendered).strip().replace(" ", "-")
     return cleaned or f"sLv-{user_value}-{index_value}"
 
+
 def generate_vless_link(uuid: str, remark: str = "sLv", address: str = None, port: int = None) -> str:
     domain = get_domain()
     addr = address if address else domain
@@ -485,18 +525,6 @@ def generate_vless_link(uuid: str, remark: str = "sLv", address: str = None, por
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uuid}@{addr}:{use_port}?{query}#{quote(remark)}"
-
-def generate_trojan_link(uuid: str, remark: str = "sLv", address: str = None, port: int = None) -> str:
-    domain = get_domain()
-    addr = address if address else domain
-    use_port = port if port else DEFAULT_PORT
-    path = f"/ws/{uuid}"
-    params = {
-        "security": "tls", "type": "ws",
-        "host": domain, "path": path, "sni": domain, "alpn": "http/1.1"
-    }
-    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"trojan://{uuid}@{addr}:{use_port}?{query}#{quote(remark)}"
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -551,7 +579,6 @@ async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
             LINKS["Default"] = {
-                "uuid": "Default",
                 "label": "Default",
                 "limit_bytes": 0,
                 "used_bytes": 0,
@@ -559,7 +586,7 @@ async def ensure_default_link():
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "active": True,
                 "expires_at": None,
-                "protocols": ["vless", "trojan"]
+                "ports": [DEFAULT_PORT],
             }
 
 def get_client_ip(websocket: WebSocket) -> str:
@@ -608,6 +635,12 @@ def _is_admin_chat(chat_id, admin_id) -> bool:
     return True
 
 async def _stop_telegram_bot():
+    """Stop any previously running bot/poller before starting a new one.
+    Without this, every restart (e.g. each time settings are saved) leaves
+    the old long-polling loop running, and Telegram only allows ONE active
+    getUpdates connection per bot token — the duplicate pollers fight each
+    other (409 Conflict) and commands like /start can silently stop being
+    delivered."""
     global bot, bot_polling_task
     if bot is not None:
         try:
@@ -655,204 +688,137 @@ async def restart_telegram_bot():
 
     @bot.message_handler(commands=['start'])
     async def cmd_start(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
-        bot_wizard_state.pop(message.chat.id, None)
-        await bot.send_message(message.chat.id, L("welcome"), parse_mode="HTML", reply_markup=build_main_keyboard())
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
+        await bot.send_message(
+            message.chat.id,
+            L("welcome"),
+            parse_mode="HTML",
+            reply_markup=build_main_keyboard()
+        )
 
     @bot.message_handler(commands=['help'])
     async def cmd_help(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
         await bot.send_message(message.chat.id, L("help_text"), parse_mode="HTML", reply_markup=build_main_keyboard())
 
-    @bot.message_handler(commands=['cancel'])
-    async def cmd_cancel(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
-        bot_wizard_state.pop(message.chat.id, None)
-        await bot.send_message(message.chat.id, L("wiz_cancel"), parse_mode="HTML", reply_markup=build_main_keyboard())
+    @bot.message_handler(commands=['cfg'])
+    async def cmd_cfg(message):
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await bot.send_message(message.chat.id, L("cfg_guide"), parse_mode="HTML", reply_markup=build_main_keyboard())
+            return
+        template = parts[1].strip()
+        if not template:
+            await bot.send_message(message.chat.id, L("cfg_format"), parse_mode="HTML")
+            return
+        CONFIG["config_name_template"] = template
+        save_db()
+        await bot.send_message(message.chat.id, L("cfg_success", template=template), parse_mode="HTML", reply_markup=build_main_keyboard())
 
     @bot.message_handler(commands=['stats'])
     async def cmd_stats(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
         s_data = await get_internal_stats()
         await bot.send_message(message.chat.id, make_stats_text(s_data), parse_mode="HTML")
 
     @bot.message_handler(commands=['users'])
     async def cmd_users(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
         utext = await make_users_text()
         await bot.send_message(message.chat.id, utext, parse_mode="HTML")
 
     @bot.message_handler(commands=['top'])
     async def cmd_top(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
         utext = await make_top_users_text()
         await bot.send_message(message.chat.id, utext, parse_mode="HTML")
 
-    # Wizard Creation
     @bot.message_handler(commands=['create'])
     async def cmd_create(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
-        bot_wizard_state[message.chat.id] = {"step": "name"}
-        msg = await bot.send_message(message.chat.id, L("wiz_name"), parse_mode="HTML")
-        await bot.register_next_step_handler(msg, process_wiz_name)
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
+        resp = await handle_create_command(message.text)
+        await bot.send_message(message.chat.id, resp, parse_mode="HTML")
 
-    async def process_wiz_name(message):
-        if message.text.startswith('/'): return await handle_wiz_cancel(message)
-        name = message.text.strip()
-        if not re.match(r'^[a-zA-Z0-9\-_. ]+$', name):
-            msg = await bot.send_message(message.chat.id, L("create_bad_name"), parse_mode="HTML")
-            return await bot.register_next_step_handler(msg, process_wiz_name)
-        async with LINKS_LOCK:
-            if any(link.get("label") == name for link in LINKS.values()):
-                msg = await bot.send_message(message.chat.id, L("create_exists", label=name), parse_mode="HTML")
-                return await bot.register_next_step_handler(msg, process_wiz_name)
-        bot_wizard_state[message.chat.id]["name"] = name
-        bot_wizard_state[message.chat.id]["step"] = "limit"
-        msg = await bot.send_message(message.chat.id, L("wiz_limit"), parse_mode="HTML")
-        await bot.register_next_step_handler(msg, process_wiz_limit)
-
-    async def process_wiz_limit(message):
-        if message.text.startswith('/'): return await handle_wiz_cancel(message)
-        try:
-            limit = float(message.text.strip())
-        except ValueError:
-            msg = await bot.send_message(message.chat.id, L("create_bad_num"), parse_mode="HTML")
-            return await bot.register_next_step_handler(msg, process_wiz_limit)
-        bot_wizard_state[message.chat.id]["limit"] = limit
-        bot_wizard_state[message.chat.id]["step"] = "days"
-        msg = await bot.send_message(message.chat.id, L("wiz_days"), parse_mode="HTML")
-        await bot.register_next_step_handler(msg, process_wiz_days)
-
-    async def process_wiz_days(message):
-        if message.text.startswith('/'): return await handle_wiz_cancel(message)
-        try:
-            days = float(message.text.strip())
-        except ValueError:
-            msg = await bot.send_message(message.chat.id, L("create_bad_num"), parse_mode="HTML")
-            return await bot.register_next_step_handler(msg, process_wiz_days)
-        bot_wizard_state[message.chat.id]["days"] = days
-        bot_wizard_state[message.chat.id]["step"] = "proto"
-        await bot.send_message(message.chat.id, L("wiz_proto"), parse_mode="HTML", reply_markup=build_protocol_keyboard(message.chat.id))
-
-    async def handle_wiz_cancel(message):
-        bot_wizard_state.pop(message.chat.id, None)
-        await cmd_cancel(message)
+    @bot.message_handler(commands=['test'])
+    @bot.message_handler(commands=['test'])
+    async def cmd_test(message):
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
+        resp = await handle_test_command(message.text)
+        await bot.send_message(message.chat.id, resp, parse_mode="HTML")
 
     @bot.message_handler(commands=['addaddr'])
     async def cmd_addaddr(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
-        msg = await bot.send_message(message.chat.id, L("addaddr_guide"), parse_mode="HTML")
-        await bot.register_next_step_handler(msg, process_addaddr)
-
-    async def process_addaddr(message):
-        if message.text.startswith('/'): return await handle_wiz_cancel(message)
-        addr = message.text.strip()
-        if not re.match(r'^[a-zA-Z0-9\-_. ]+$', addr):
-            await bot.send_message(message.chat.id, L("addaddr_invalid"), parse_mode="HTML")
+        if not _is_admin_chat(message.chat.id, admin_id):
             return
-        async with CUSTOM_ADDRESSES_LOCK:
-            if addr in CUSTOM_ADDRESSES:
-                await bot.send_message(message.chat.id, L("addaddr_exists", addr=addr), parse_mode="HTML")
-                return
-            CUSTOM_ADDRESSES.append(addr)
-        save_db()
-        await bot.send_message(message.chat.id, L("addaddr_success", addr=addr), parse_mode="HTML", reply_markup=build_main_keyboard())
+        resp = await handle_addaddr_command(message.text)
+        await bot.send_message(message.chat.id, resp, parse_mode="HTML")
 
     @bot.message_handler(commands=['disable'])
     async def cmd_disable(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
         resp = await handle_toggle_command(message.text, False)
         await bot.send_message(message.chat.id, resp, parse_mode="HTML")
 
     @bot.message_handler(commands=['enable'])
     async def cmd_enable(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
         resp = await handle_toggle_command(message.text, True)
         await bot.send_message(message.chat.id, resp, parse_mode="HTML")
 
     @bot.message_handler(commands=['reset'])
     async def cmd_reset(message):
-        if not _is_admin_chat(message.chat.id, admin_id): return
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
         resp = await handle_reset_command(message.text)
         await bot.send_message(message.chat.id, resp, parse_mode="HTML")
 
     @bot.callback_query_handler(func=lambda call: True)
     async def handle_callback(call):
-        if not _is_admin_chat(call.message.chat.id, admin_id): return
+        if not _is_admin_chat(call.message.chat.id, admin_id):
+            return
         await bot.answer_callback_query(call.id)
 
-        data = call.data
-        if data == "tg_lang_toggle":
+        if call.data == "tg_lang_toggle":
             CONFIG["bot_lang"] = "fa" if bot_lang() == "en" else "en"
             save_db()
             await bot.send_message(call.message.chat.id, L("lang_switched"), parse_mode="HTML", reply_markup=build_main_keyboard())
-        elif data == "tg_stats":
+        elif call.data == "tg_stats":
             s_data = await get_internal_stats()
             await bot.send_message(call.message.chat.id, make_stats_text(s_data), parse_mode="HTML", reply_markup=build_main_keyboard())
-        elif data == "tg_users":
+        elif call.data == "tg_users":
             utext = await make_users_text()
             await bot.send_message(call.message.chat.id, utext, parse_mode="HTML", reply_markup=build_main_keyboard())
-        elif data == "tg_top":
+        elif call.data == "tg_top":
             utext = await make_top_users_text()
             await bot.send_message(call.message.chat.id, utext, parse_mode="HTML", reply_markup=build_main_keyboard())
-        elif data == "tg_create_guide":
-            bot_wizard_state[call.message.chat.id] = {"step": "name"}
-            msg = await bot.send_message(call.message.chat.id, L("wiz_name"), parse_mode="HTML")
-            await bot.register_next_step_handler(msg, process_wiz_name)
-        elif data == "tg_add_ip_guide":
-            msg = await bot.send_message(call.message.chat.id, L("addaddr_guide"), parse_mode="HTML")
-            await bot.register_next_step_handler(msg, process_addaddr)
-        elif data == "tg_help":
+        elif call.data == "tg_create_guide":
+            await bot.send_message(call.message.chat.id, L("create_guide"), parse_mode="HTML", reply_markup=build_main_keyboard())
+        elif call.data == "tg_add_ip_guide":
+            await bot.send_message(call.message.chat.id, L("addip_guide"), parse_mode="HTML", reply_markup=build_main_keyboard())
+        elif call.data == "tg_help":
             await bot.send_message(call.message.chat.id, L("help_text"), parse_mode="HTML", reply_markup=build_main_keyboard())
-        elif data.startswith("proto_"):
-            parts = data.split("_")
-            proto_type = parts[1]
-            cid = int(parts[2])
-            if cid in bot_wizard_state and bot_wizard_state[cid].get("step") == "proto":
-                state = bot_wizard_state.pop(cid)
-                protocols = ["vless", "trojan"] if proto_type == "both" else [proto_type]
-                resp = await finalize_wizard_creation(state, protocols)
-                await bot.send_message(cid, resp, parse_mode="HTML", reply_markup=build_main_keyboard())
-
-    async def finalize_wizard_creation(state, protocols):
-        label = state["name"]
-        limit_value = state["limit"]
-        days_valid = state["days"]
-        limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, "GB")
-        expires_at = None
-        if days_valid > 0:
-            expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
-        
-        uid = str(uuid.uuid4())
-        async with LINKS_LOCK:
-            LINKS[uid] = {
-                "uuid": uid,
-                "label": label,
-                "limit_bytes": limit_bytes,
-                "used_bytes": 0,
-                "daily_limit_bytes": 0,
-                "daily_used_bytes": 0,
-                "daily_usage_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                "max_connections": 0,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "active": True,
-                "expires_at": expires_at,
-                "protocols": protocols
-            }
-        save_db()
-        sub_url = f"https://{get_domain()}/sub/{uid}"
-        quota_str = _fmt_bytes(limit_bytes) if limit_bytes > 0 else L("unlimited")
-        expiry_str = L("days_fmt", days=days_valid) if days_valid > 0 else L("unlimited")
-        proto_str = " & ".join(p.upper() for p in protocols)
-
-        return L(
-            "create_success",
-            label=label, quota=quota_str, expiry=expiry_str,
-            protocols=proto_str, sub=sub_url,
-        )
+        elif call.data == "tg_cfg_guide":
+            await bot.send_message(call.message.chat.id, L("cfg_guide"), parse_mode="HTML", reply_markup=build_main_keyboard())
 
     async def _run_polling(bot_instance):
         try:
+            # NOTE: skip_pending_updates is intentionally NOT passed here — the
+            # pyTelegramBotAPI version installed on this server forwards it into
+            # _process_polling(), which rejects it (TypeError), crashing polling
+            # every few seconds and preventing the bot from ever receiving
+            # updates. Pending updates are already cleared above via
+            # deleteWebhook?drop_pending_updates=true, so this isn't needed.
             await bot_instance.infinity_polling()
         except Exception as e:
             logger.error(f"Telegram Bot: polling loop stopped unexpectedly: {e}")
@@ -870,16 +836,21 @@ async def send_tg_message(text: str):
             logger.error(f"Error sending TG notification: {e}")
 
 def fmt_exp_py(ea: str | None) -> str:
-    if not ea: return "∞"
+    if not ea:
+        return "∞"
     exp = parse_expires_at(ea)
-    if not exp: return "∞"
+    if not exp:
+        return "∞"
     diff = exp - datetime.now(timezone.utc)
     seconds = diff.total_seconds()
-    if seconds <= 0: return "Expired"
+    if seconds <= 0:
+        return "Expired"
     days = int(seconds // 86400)
-    if days > 0: return f"{days}d"
+    if days > 0:
+        return f"{days}d"
     hours = int(seconds // 3600)
-    if hours > 0: return f"{hours}h"
+    if hours > 0:
+        return f"{hours}h"
     minutes = int(seconds // 60)
     return f"{minutes}m"
 
@@ -914,20 +885,26 @@ async def make_users_text() -> str:
     lines = [L("users_title")]
     async with LINKS_LOCK:
         items = list(LINKS.items())
-    if not items: return L("no_inbounds")
+
+    if not items:
+        return L("no_inbounds")
+
     for uid, data in items:
         used = _fmt_bytes(data["used_bytes"])
         limit = _fmt_bytes(data["limit_bytes"]) if data["limit_bytes"] > 0 else "∞"
         ex = fmt_exp_py(data.get("expires_at"))
         status = L("status_on") if data["active"] else L("status_off")
         lines.append(L("users_line", label=data['label'], used=used, limit=limit, exp=ex, status=status))
+
     return "\n".join(lines[:35])
 
 async def make_top_users_text() -> str:
     lines = [L("top_title")]
     async with LINKS_LOCK:
         items = list(LINKS.items())
-    if not items: return L("no_inbounds")
+    if not items:
+        return L("no_inbounds")
+
     sorted_items = sorted(items, key=lambda x: x[1].get("used_bytes", 0), reverse=True)[:5]
     for i, (uid, data) in enumerate(sorted_items, 1):
         used = _fmt_bytes(data["used_bytes"])
@@ -935,37 +912,155 @@ async def make_top_users_text() -> str:
         lines.append(L("top_line", i=i, label=data['label'], used=used, limit=limit))
     return "\n".join(lines)
 
+async def handle_create_command(text: str):
+    parts = text.split()
+    if len(parts) < 2:
+        return L("create_format")
+    label = parts[1]
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+        return L("create_bad_name")
+
+    limit_value = 0.0
+    days_valid = 0
+
+    if len(parts) >= 3:
+        try:
+            limit_value = float(parts[2])
+        except ValueError:
+            return L("create_bad_limit")
+
+    if len(parts) >= 4:
+        try:
+            days_valid = int(parts[3])
+        except ValueError:
+            return L("create_bad_days")
+
+    async with LINKS_LOCK:
+        if label in LINKS:
+            return L("create_exists", label=label)
+
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, "GB")
+    expires_at = None
+    if days_valid > 0:
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
+
+    uid = label
+    async with LINKS_LOCK:
+        LINKS[uid] = {
+            "label": label,
+            "limit_bytes": limit_bytes,
+            "used_bytes": 0,
+            "daily_limit_bytes": 0,
+            "daily_used_bytes": 0,
+            "daily_usage_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "max_connections": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "active": True,
+            "expires_at": expires_at,
+        }
+
+    save_db()
+    vless_link = generate_vless_link(uid, remark=build_config_name(label, uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT)
+    sub_url = f"https://{get_domain()}/sub/{uid}"
+
+    quota_str = _fmt_bytes(limit_bytes) if limit_bytes > 0 else L("unlimited")
+    expiry_str = L("days_fmt", days=days_valid) if days_valid > 0 else L("unlimited")
+
+    return L(
+        "create_success",
+        label=label, quota=quota_str, expiry=expiry_str,
+        vless=vless_link, sub=sub_url,
+    )
+
+async def handle_test_command(text: str):
+    parts = text.split()
+    if len(parts) < 6:
+        return L("test_format")
+    label = parts[1]
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+        return L("create_bad_name")
+    try:
+        limit_value = float(parts[2])
+    except ValueError:
+        return L("create_bad_limit")
+    unit = parts[3].upper()
+    if unit not in ("GB", "MB", "KB"):
+        return L("test_format")
+    try:
+        expiry_value = float(parts[4])
+    except ValueError:
+        return L("test_format")
+    expiry_unit = parts[5].lower()
+    if expiry_unit not in ("days", "day", "hours", "hour", "minutes", "minute"):
+        return L("test_format")
+
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, unit)
+    expires_delta = parse_expiry_delta(expiry_value, expiry_unit)
+    if expires_delta is None:
+        return L("test_format")
+    expires_at = (datetime.now(timezone.utc) + expires_delta).isoformat()
+    uid = f"{label}-{secrets.token_hex(4)}"
+    async with LINKS_LOCK:
+        LINKS[uid] = {
+            "label": uid,
+            "limit_bytes": limit_bytes,
+            "used_bytes": 0,
+            "daily_limit_bytes": 0,
+            "daily_used_bytes": 0,
+            "daily_usage_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "max_connections": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "active": True,
+            "expires_at": expires_at,
+        }
+    save_db()
+    vless_link = generate_vless_link(uid, remark=build_config_name(uid, uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT)
+    sub_url = f"https://{get_domain()}/sub/{uid}"
+    quota_str = _fmt_bytes(limit_bytes) if limit_bytes > 0 else L("unlimited")
+    expiry_label = f"{int(expiry_value)} {expiry_unit}"
+    return L(
+        "test_success",
+        label=uid, quota=quota_str, expiry=expiry_label,
+        vless=vless_link, sub=sub_url,
+    )
+
+async def handle_addaddr_command(text: str) -> str:
+    parts = text.split()
+    if len(parts) < 2:
+        return L("addaddr_format")
+    addr = parts[1].strip()
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', addr):
+        return L("addaddr_invalid")
+    async with CUSTOM_ADDRESSES_LOCK:
+        if addr in CUSTOM_ADDRESSES:
+            return L("addaddr_exists", addr=addr)
+        CUSTOM_ADDRESSES.append(addr)
+    save_db()
+    return L("addaddr_success", addr=addr)
+
 async def handle_toggle_command(text: str, active_state: bool) -> str:
     parts = text.split()
     if len(parts) < 2:
         action_name = "enable" if active_state else "disable"
         return L("toggle_format", action=action_name)
     name = parts[1].strip()
-    target_uid = None
     async with LINKS_LOCK:
-        for uid, l in LINKS.items():
-            if l.get("label") == name:
-                target_uid = uid
-                break
-        if not target_uid:
+        if name not in LINKS:
             return L("toggle_not_found", name=name)
-        LINKS[target_uid]["active"] = active_state
+        LINKS[name]["active"] = active_state
     save_db()
     state_str = L("state_enabled") if active_state else L("state_disabled")
     return L("toggle_success", name=name, state=state_str)
 
 async def handle_reset_command(text: str) -> str:
     parts = text.split()
-    if len(parts) < 2: return L("reset_format")
+    if len(parts) < 2:
+        return L("reset_format")
     name = parts[1].strip()
-    target_uid = None
     async with LINKS_LOCK:
-        for uid, l in LINKS.items():
-            if l.get("label") == name:
-                target_uid = uid
-                break
-        if not target_uid: return L("toggle_not_found", name=name)
-        LINKS[target_uid]["used_bytes"] = 0
+        if name not in LINKS:
+            return L("toggle_not_found", name=name)
+        LINKS[name]["used_bytes"] = 0
     save_db()
     return L("reset_success", name=name)
 
@@ -977,18 +1072,27 @@ async def telegram_notifier_cron():
             if not token or not admin_id:
                 await asyncio.sleep(60)
                 continue
-            async with LINKS_LOCK: items = list(LINKS.items())
+
+            async with LINKS_LOCK:
+                items = list(LINKS.items())
+            
             for uid, data in items:
-                if not data["active"]: continue
+                if not data["active"]:
+                    continue
+                
+                # Check Quota
                 used = data["used_bytes"]
                 limit = data["limit_bytes"]
                 label = data["label"]
+                
                 if limit > 0 and used >= limit:
                     notif_key = f"quota_{uid}"
                     if notif_key not in notified_uids:
                         msg = L("quota_alert", label=label, used=_fmt_bytes(used), limit=_fmt_bytes(limit))
                         await send_tg_message(msg)
                         notified_uids.add(notif_key)
+                
+                # Check Expiry
                 expires_at_str = data.get("expires_at")
                 if expires_at_str:
                     exp = parse_expires_at(expires_at_str)
@@ -998,30 +1102,33 @@ async def telegram_notifier_cron():
                             msg = L("expiry_alert", label=label, exp=expires_at_str)
                             await send_tg_message(msg)
                             notified_uids.add(notif_key)
+                            
         except Exception as e:
             logger.error(f"Error in notification cron: {e}")
+            
         await asyncio.sleep(60)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    camouflage_urls = [
-        "https://pypi.org/",
-        "https://www.npmjs.com/",
-        "https://ubuntu.com/",
-        "https://docker.com"
-    ]
-    target_url = random.choice(camouflage_urls)
-    return RedirectResponse(url=target_url, status_code=302)
+    # NOTE: this used to return {"service": "sLv Panel", ...} — a plaintext
+    # admission that this server is a proxy panel, visible to anyone who simply
+    # curls the domain. Active-probing/DPI systems check exactly this kind of
+    # thing. Return something generic instead.
+    return Response(content="OK", media_type="text/plain")
+
 @app.get("/health")
 async def health():
-    async with connections_lock: conn_count = len(connections)
+    async with connections_lock:
+        conn_count = len(connections)
     return {"status": "ok", "connections": conn_count, "uptime": uptime()}
 
 def request_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded: return forwarded.split(",")[0].strip()
-    if request.client: return request.client.host
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
     return "unknown"
 
 @app.post("/api/login")
@@ -1044,9 +1151,19 @@ async def api_login(request: Request):
     token = await create_session()
     resp = JSONResponse({"ok": True})
     secure_cookie = False
-    if CONFIG.get("cookie_secure") in ("1", "true", "yes"): secure_cookie = True
-    elif CONFIG.get("cookie_secure") == "auto": secure_cookie = get_domain() not in ("localhost", "127.0.0.1")
-    resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, secure=secure_cookie, samesite="lax", path="/")
+    if CONFIG.get("cookie_secure") in ("1", "true", "yes"):
+        secure_cookie = True
+    elif CONFIG.get("cookie_secure") == "auto":
+        secure_cookie = get_domain() not in ("localhost", "127.0.0.1")
+    resp.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=SESSION_TTL,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="lax",
+        path="/",
+    )
     return resp
 
 @app.post("/api/logout")
@@ -1067,14 +1184,17 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     body = await request.json()
     current = str(body.get("current_password") or "")
     new = str(body.get("new_password") or "")
-    if not password_matches(current): raise HTTPException(status_code=400, detail="Current password is incorrect")
-    if len(new) < 4: raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    if not password_matches(current):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if len(new) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
     AUTH["password_hash"] = hash_password(new)
     save_db()
     current_token = request.cookies.get(SESSION_COOKIE)
     async with SESSIONS_LOCK:
         SESSIONS.clear()
-        if current_token: SESSIONS[current_token] = time.time() + SESSION_TTL
+        if current_token:
+            SESSIONS[current_token] = time.time() + SESSION_TTL
     return {"ok": True}
 
 @app.get("/api/settings")
@@ -1083,59 +1203,26 @@ async def get_settings(_=Depends(require_auth)):
         "telegram_token": CONFIG["telegram_token"],
         "telegram_admin_id": CONFIG["telegram_admin_id"],
         "config_name_template": CONFIG.get("config_name_template", "sLv-{USER}-{INDEX}"),
-        "config_port": CONFIG.get("config_port", 443),
-        "available_config_ports": AVAILABLE_CONFIG_PORTS,
     }
 
-@app.post("/api/settings/bot")
-async def update_bot_settings(request: Request, _=Depends(require_auth)):
+@app.post("/api/settings")
+async def update_settings(request: Request, _=Depends(require_auth)):
     body = await request.json()
     CONFIG["telegram_token"] = body.get("telegram_token", "").strip()
     CONFIG["telegram_admin_id"] = body.get("telegram_admin_id", "").strip()
-    save_db()
-    await restart_telegram_bot()
-    return {"ok": True}
-
-@app.post("/api/settings/config")
-async def update_config_settings(request: Request, _=Depends(require_auth)):
-    body = await request.json()
     template_value = (body.get("config_name_template") or "").strip()
     if template_value:
         CONFIG["config_name_template"] = template_value
     else:
         CONFIG["config_name_template"] = "sLv-{USER}-{INDEX}"
-    CONFIG["config_port"] = normalize_config_port(body.get("config_port", CONFIG.get("config_port", 443)))
     save_db()
+    await restart_telegram_bot()
     return {"ok": True}
-
-@app.post("/api/links/{uid}/rotate-uuid")
-async def rotate_link_uuid(uid: str, _=Depends(require_auth)):
-    async with LINKS_LOCK:
-        if uid not in LINKS: raise HTTPException(status_code=404, detail="link not found")
-        existing = LINKS.pop(uid)
-        new_uuid = str(uuid.uuid4())
-        existing["uuid"] = new_uuid
-        LINKS[new_uuid] = existing
-    save_db()
-    return {"ok": True, "uuid": new_uuid}
-
-@app.post("/api/links/rotate-uuids")
-async def rotate_all_uuids(_=Depends(require_auth)):
-    async with LINKS_LOCK:
-        items = list(LINKS.items())
-        LINKS.clear()
-        new_map = {}
-        for old_uid, data in items:
-            new_uuid = str(uuid.uuid4())
-            data["uuid"] = new_uuid
-            new_map[new_uuid] = data
-        LINKS.update(new_map)
-    save_db()
-    return {"ok": True, "count": len(new_map)}
 
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
-    async with connections_lock: conn_count = len(connections)
+    async with connections_lock:
+        conn_count = len(connections)
     return {
         "active_connections": conn_count,
         "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
@@ -1155,10 +1242,12 @@ async def get_stats(_=Depends(require_auth)):
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
     label = (body.get("label") or "New Link").strip()[:60]
-    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label): raise HTTPException(status_code=400, detail="Invalid characters in name")
-    if not label: raise HTTPException(status_code=400, detail="Inbound name is required")
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+        raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
+    if not label:
+        raise HTTPException(status_code=400, detail="Inbound name is required")
     async with LINKS_LOCK:
-        if any(link.get("label") == label for link in LINKS.values()):
+        if label in LINKS:
             raise HTTPException(status_code=400, detail="An inbound with this name already exists")
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = (body.get("limit_unit") or "GB").upper()
@@ -1167,11 +1256,11 @@ async def create_link(request: Request, _=Depends(require_auth)):
     daily_limit_unit = (body.get("daily_limit_unit") or limit_unit).upper()
     daily_limit_bytes = 0 if daily_limit_value <= 0 else parse_size_to_bytes(daily_limit_value, daily_limit_unit)
     max_conn = int(body.get("max_connections") or 0)
-    if max_conn < 0: max_conn = 0
+    if max_conn < 0:
+        max_conn = 0
     clean_ip_count = int(body.get("clean_ip_count") or 0)
-    if clean_ip_count < 0: clean_ip_count = 0
-    protocols = body.get("protocols") or ["vless", "trojan"]
-    
+    if clean_ip_count < 0:
+        clean_ip_count = 0
     expiry_value = body.get("expiry_value")
     expiry_unit = (body.get("expiry_unit") or "days").lower()
     expires_at: str | None = None
@@ -1179,10 +1268,10 @@ async def create_link(request: Request, _=Depends(require_auth)):
         expiry_delta = parse_expiry_delta(expiry_value, expiry_unit)
         if expiry_delta is not None:
             expires_at = (datetime.now(timezone.utc) + expiry_delta).isoformat()
-    except (ValueError, TypeError): pass
-    uid = str(uuid.uuid4())
+    except (ValueError, TypeError):
+        pass
+    uid = label
     link_data = {
-        "uuid": uid,
         "label": label,
         "limit_bytes": limit_bytes,
         "used_bytes": 0,
@@ -1193,30 +1282,36 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "active": True,
         "expires_at": expires_at,
-        "protocols": protocols
     }
     if clean_ip_count > 0:
-        async with CUSTOM_ADDRESSES_LOCK: available_addresses = list(CUSTOM_ADDRESSES)
+        async with CUSTOM_ADDRESSES_LOCK:
+            available_addresses = list(CUSTOM_ADDRESSES)
         if available_addresses:
             selected_addresses = random.sample(available_addresses, k=min(clean_ip_count, len(available_addresses)))
             link_data["clean_ip_addresses"] = selected_addresses
     async with LINKS_LOCK:
         LINKS[uid] = link_data
     save_db()
-    return {"uuid": uid, "label": label}
+    return {
+        "uuid": uid,
+        "label": label,
+        "limit_bytes": limit_bytes,
+        "used_bytes": 0,
+        "daily_limit_bytes": daily_limit_bytes,
+        "daily_used_bytes": 0,
+        "max_connections": max_conn,
+        "active": True,
+        "created_at": LINKS[uid]["created_at"],
+        "expires_at": expires_at,
+        "vless_link": generate_vless_link(uid, remark=build_config_name(label, uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT),
+    }
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     result = []
-    async with LINKS_LOCK: items = list(LINKS.items())
+    async with LINKS_LOCK:
+        items = list(LINKS.items())
     for uid, data in items:
-        protocols = data.get("protocols", ["vless"])
-        main_link = ""
-        if "vless" in protocols:
-            main_link = generate_vless_link(uid, remark=build_config_name(data.get('label'), uid, None, CONFIG.get("config_port", 443), 1), port=CONFIG.get("config_port", 443))
-        elif "trojan" in protocols:
-            main_link = generate_trojan_link(uid, remark=build_config_name(data.get('label'), uid, None, CONFIG.get("config_port", 443), 1), port=CONFIG.get("config_port", 443))
-
         result.append({
             "uuid": uid,
             "label": data["label"],
@@ -1228,9 +1323,8 @@ async def list_links(_=Depends(require_auth)):
             "active": data["active"],
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
-            "protocols": protocols,
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": main_link,
+            "vless_link": generate_vless_link(uid, remark=build_config_name(data.get('label'), uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -1239,9 +1333,10 @@ async def list_links(_=Depends(require_auth)):
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     async with LINKS_LOCK:
-        if uid not in LINKS: raise HTTPException(status_code=404, detail="link not found")
-        if "active" in body: LINKS[uid]["active"] = bool(body["active"])
-        if "protocols" in body: LINKS[uid]["protocols"] = body["protocols"]
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+        if "active" in body:
+            LINKS[uid]["active"] = bool(body["active"])
         if "limit_value" in body:
             limit_value = float(body.get("limit_value") or 0)
             limit_unit = (body.get("limit_unit") or "GB").upper()
@@ -1255,7 +1350,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         if "reset_daily_usage" in body and body["reset_daily_usage"]:
             LINKS[uid]["daily_used_bytes"] = 0
             LINKS[uid]["daily_usage_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if "label" in body: LINKS[uid]["label"] = str(body["label"])[:60]
+        if "label" in body:
+            LINKS[uid]["label"] = str(body["label"])[:60]
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
@@ -1264,15 +1360,19 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             expiry_unit = (body.get("expiry_unit") or "days").lower()
             try:
                 expiry_delta = parse_expiry_delta(expiry_value, expiry_unit)
-                if expiry_delta is not None: LINKS[uid]["expires_at"] = (datetime.now(timezone.utc) + expiry_delta).isoformat()
-                else: LINKS[uid]["expires_at"] = None
-            except (ValueError, TypeError): pass
+                if expiry_delta is not None:
+                    LINKS[uid]["expires_at"] = (datetime.now(timezone.utc) + expiry_delta).isoformat()
+                else:
+                    LINKS[uid]["expires_at"] = None
+            except (ValueError, TypeError):
+                pass
     save_db()
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
-    async with LINKS_LOCK: LINKS.pop(uid, None)
+    async with LINKS_LOCK:
+        LINKS.pop(uid, None)
     save_db()
     await close_connections_for_link(uid)
     return {"ok": True}
@@ -1280,48 +1380,62 @@ async def delete_link(uid: str, _=Depends(require_auth)):
 @app.post("/api/addresses/import")
 async def import_addresses_from_file(_=Depends(require_auth)):
     file_path = os.path.join(os.path.dirname(__file__), "ips.txt")
-    if not os.path.exists(file_path): raise HTTPException(status_code=404, detail="ips.txt not found")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="ips.txt not found")
+
     imported_addresses = []
     with open(file_path, "r", encoding="utf-8") as handle:
         for raw_line in handle:
             addr = raw_line.strip()
-            if not addr: continue
-            if not re.match(r'^[a-zA-Z0-9\-_. ]+$', addr): continue
+            if not addr:
+                continue
+            if not re.match(r'^[a-zA-Z0-9\-_. ]+$', addr):
+                continue
             imported_addresses.append(addr)
+
     async with CUSTOM_ADDRESSES_LOCK:
         existing = set(CUSTOM_ADDRESSES)
         new_addresses = [addr for addr in imported_addresses if addr not in existing]
-        for addr in new_addresses: CUSTOM_ADDRESSES.append(addr)
+        for addr in new_addresses:
+            CUSTOM_ADDRESSES.append(addr)
+
     save_db()
     return {"ok": True, "added": len(new_addresses), "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
-    async with CUSTOM_ADDRESSES_LOCK: return {"addresses": list(CUSTOM_ADDRESSES)}
+    async with CUSTOM_ADDRESSES_LOCK:
+        return {"addresses": list(CUSTOM_ADDRESSES)}
 
 @app.post("/api/addresses")
 async def add_address(request: Request, _=Depends(require_auth)):
     body = await request.json()
     address = (body.get("address") or "").strip()
-    if not address: raise HTTPException(status_code=400, detail="Address is required")
-    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', address): raise HTTPException(status_code=400, detail="Invalid address format")
+    if not address:
+        raise HTTPException(status_code=400, detail="Address is required")
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
+        raise HTTPException(status_code=400, detail="Address must contain only English letters, numbers, and characters: - _ .")
     async with CUSTOM_ADDRESSES_LOCK:
-        if address in CUSTOM_ADDRESSES: raise HTTPException(status_code=400, detail="Address already exists")
+        if address in CUSTOM_ADDRESSES:
+            raise HTTPException(status_code=400, detail="Address already exists")
         CUSTOM_ADDRESSES.append(address)
     save_db()
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.delete("/api/addresses")
 async def delete_all_addresses(_=Depends(require_auth)):
-    async with CUSTOM_ADDRESSES_LOCK: CUSTOM_ADDRESSES.clear()
+    async with CUSTOM_ADDRESSES_LOCK:
+        CUSTOM_ADDRESSES.clear()
     save_db()
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
     async with CUSTOM_ADDRESSES_LOCK:
-        if 0 <= index < len(CUSTOM_ADDRESSES): CUSTOM_ADDRESSES.pop(index)
-        else: raise HTTPException(status_code=404, detail="Address not found")
+        if 0 <= index < len(CUSTOM_ADDRESSES):
+            CUSTOM_ADDRESSES.pop(index)
+        else:
+            raise HTTPException(status_code=404, detail="Address not found")
     save_db()
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
@@ -1332,19 +1446,23 @@ async def ws_live_logs(websocket: WebSocket, token: str | None = None):
     if not token or not await is_valid_session(token):
         await websocket.close(code=1008, reason="Unauthorized")
         return
-    for item in list(log_queue): await websocket.send_text(item)
+    for item in list(log_queue):
+        await websocket.send_text(item)
     last_idx = len(log_queue)
     try:
         while True:
             await asyncio.sleep(0.5)
             curr = list(log_queue)
             if len(curr) > last_idx:
-                for idx in range(last_idx, len(curr)): await websocket.send_text(curr[idx])
+                for idx in range(last_idx, len(curr)):
+                    await websocket.send_text(curr[idx])
                 last_idx = len(curr)
             elif len(curr) < last_idx:
                 last_idx = len(curr)
-    except WebSocketDisconnect: pass
-    except Exception: pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 # ── Landing Page Generator ────────────────────────────────────────────────────
 def _fmt_bytes(b: int) -> str:
@@ -1356,7 +1474,6 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     expires_at_str = link.get("expires_at")
-    protocols = link.get("protocols", ["vless"])
 
     usage_str = f"{_fmt_bytes(used)} / Unlimited" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
     pct = round((used / limit) * 100, 1) if limit > 0 else 0
@@ -1364,28 +1481,18 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
     rem_str = _fmt_bytes(rem) if rem >= 0 else "Unlimited"
 
     secs_left = seconds_until_expiry(expires_at_str)
-    if secs_left is None: expiry_str = "Unlimited"
-    elif secs_left == 0: expiry_str = "Expired"
+    if secs_left is None:
+        expiry_str = "Unlimited"
+    elif secs_left == 0:
+        expiry_str = "Expired"
     else:
         days = secs_left // 86400
         hours = (secs_left % 86400) // 3600
         expiry_str = f"{days} Days, {hours} Hours Left"
 
-    configs = []
-    idx = 1
-    if "vless" in protocols:
-        configs.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, CONFIG.get("config_port", 443), idx), port=CONFIG.get("config_port", 443)))
-        idx += 1
-        for addr in addresses:
-            configs.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, CONFIG.get("config_port", 443), idx), address=addr, port=CONFIG.get("config_port", 443)))
-            idx += 1
-    
-    if "trojan" in protocols:
-        configs.append(generate_trojan_link(uid, remark=build_config_name(link.get('label'), uid, None, CONFIG.get("config_port", 443), idx), port=CONFIG.get("config_port", 443)))
-        idx += 1
-        for addr in addresses:
-            configs.append(generate_trojan_link(uid, remark=build_config_name(link.get('label'), uid, addr, CONFIG.get("config_port", 443), idx), address=addr, port=CONFIG.get("config_port", 443)))
-            idx += 1
+    configs = [generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT)]
+    for i, addr in enumerate(addresses):
+        configs.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, DEFAULT_PORT, i + 1), address=addr, port=DEFAULT_PORT))
 
     configs_json = json.dumps(configs)
 
@@ -1420,6 +1527,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
             border: 1px solid rgba(255,255,255,0.14);
             box-shadow: 0 30px 90px rgba(0,0,0,0.32);
             backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
         }}
         .hero {{
             display: flex;
@@ -1456,9 +1564,9 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
         .progress {{ height: 8px; border-radius: 999px; overflow: hidden; background: rgba(255,255,255,0.08); margin: 12px 0 8px; }}
         .progress > div {{ height: 100%; border-radius: inherit; background: linear-gradient(90deg, #70d6ff, #ffd166); transition: width 0.4s ease; }}
         .stats-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
-        .node-list {{ display: flex; flex-direction: column; gap: 10px; margin-top: 10px; max-height: 350px; overflow-y: auto; padding-right: 5px; }}
+        .node-list {{ display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }}
         .node {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; border-radius: 14px; background: rgba(10,15,26,0.68); border: 1px solid rgba(255,255,255,0.08); }}
-        .node-name {{ font-size: 13px; font-weight: 600; color: #f5f7ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex:1; }}
+        .node-name {{ font-size: 13px; font-weight: 600; color: #f5f7ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
         .actions {{ display: flex; gap: 6px; }}
         .btn {{ font-family: inherit; font-size: 11px; font-weight: 700; border-radius: 999px; border: none; padding: 7px 10px; cursor: pointer; transition: all 0.2s; }}
         .btn-gold {{ background: linear-gradient(135deg, #ffd166, #ffb347); color: #090c16; }}
@@ -1512,7 +1620,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
         </div>
 
         <div class="card">
-            <div class="label">Available Nodes ({len(configs)})</div>
+            <div class="label">Available Nodes</div>
             <div class="node-list" id="config-list"></div>
         </div>
     </div>
@@ -1551,10 +1659,9 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
         listEl.innerHTML = configs.map((cfg, i) => {{
             const parts = cfg.split('#');
             const remark = parts[1] ? decodeURIComponent(parts[1]) : 'Node ' + (i + 1);
-            let icon = cfg.startsWith('vless') ? '🟣' : '🟢';
             return `
                 <div class="node">
-                    <div class="node-name">${{icon}} ${{remark}}</div>
+                    <div class="node-name">${{remark}}</div>
                     <div class="actions">
                         <button class="btn btn-ghost" onclick="copyTxt('${{cfg}}')">Copy</button>
                         <button class="btn btn-gold" onclick="showQR('${{cfg}}')">QR</button>
@@ -1571,31 +1678,21 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     expires_at_str = link.get("expires_at")
-    protocols = link.get("protocols", ["vless"])
-    
     usage_str = f"{_fmt_bytes(used)} / ∞" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
     secs_left = seconds_until_expiry(expires_at_str)
-    if secs_left is None: expiry_str = "∞"
-    elif secs_left == 0: expiry_str = "Expired"
-    else: expiry_str = f"{secs_left // 86400} Days Left"
+    if secs_left is None:
+        expiry_str = "∞"
+    elif secs_left == 0:
+        expiry_str = "Expired"
+    else:
+        expiry_str = f"{secs_left // 86400} Days Left"
     
-    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0", port=CONFIG.get("config_port", 443))
+    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0", port=DEFAULT_PORT)
     links_out = [status_node]
     
-    idx = 1
-    if "vless" in protocols:
-        links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, CONFIG.get("config_port", 443), idx), port=CONFIG.get("config_port", 443)))
-        idx += 1
-        for addr in addresses:
-            links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, CONFIG.get("config_port", 443), idx), address=addr, port=CONFIG.get("config_port", 443)))
-            idx += 1
-            
-    if "trojan" in protocols:
-        links_out.append(generate_trojan_link(uid, remark=build_config_name(link.get('label'), uid, None, CONFIG.get("config_port", 443), idx), port=CONFIG.get("config_port", 443)))
-        idx += 1
-        for addr in addresses:
-            links_out.append(generate_trojan_link(uid, remark=build_config_name(link.get('label'), uid, addr, CONFIG.get("config_port", 443), idx), address=addr, port=CONFIG.get("config_port", 443)))
-            idx += 1
+    links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT))
+    for i, addr in enumerate(addresses):
+        links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, DEFAULT_PORT, i + 1), address=addr, port=DEFAULT_PORT))
             
     return "\n".join(links_out)
 
@@ -1603,10 +1700,12 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
 async def subscription_endpoint(uid: str, request: Request):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link is None: raise HTTPException(status_code=404, detail="link not found")
+        if link is None:
+            raise HTTPException(status_code=404, detail="link not found")
         link = dict(link)
         
-    if not link["active"]: raise HTTPException(status_code=403, detail="link disabled")
+    if not link["active"]:
+        raise HTTPException(status_code=403, detail="link disabled")
         
     expires_at = parse_expires_at(link.get("expires_at"))
     if expires_at is not None and expires_at < datetime.now(timezone.utc):
@@ -1615,18 +1714,22 @@ async def subscription_endpoint(uid: str, request: Request):
     if "clean_ip_addresses" in link:
         addresses = list(link["clean_ip_addresses"])
     else:
-        async with CUSTOM_ADDRESSES_LOCK: addresses = list(CUSTOM_ADDRESSES)
+        async with CUSTOM_ADDRESSES_LOCK:
+            addresses = list(CUSTOM_ADDRESSES)
 
     ua = request.headers.get("user-agent", "").lower()
     accept = request.headers.get("accept", "").lower()
     is_browser = any(x in ua for x in ["mozilla", "chrome", "safari", "opera", "edge"]) and "text/html" in accept
 
-    if is_browser: return HTMLResponse(content=generate_landing_page(link, uid, addresses))
+    if is_browser:
+        return HTMLResponse(content=generate_landing_page(link, uid, addresses))
 
     sub_content = generate_subscription_content(link, uid, addresses)
     encoded = base64.b64encode(sub_content.encode()).decode()
     total_bytes = link["limit_bytes"] if link["limit_bytes"] > 0 else UNLIMITED_QUOTA_BYTES
-    expire_ts = int(expires_at.timestamp()) if expires_at is not None else 0
+    expire_ts = 0
+    if expires_at is not None:
+        expire_ts = int(expires_at.timestamp())
         
     headers = {
         "Content-Type": "text/plain; charset=utf-8",
@@ -1636,10 +1739,13 @@ async def subscription_endpoint(uid: str, request: Request):
     }
     return Response(content=encoded, headers=headers)
 
-# ── Protocol Parsers (VLESS & Trojan) ──────────────────────────────────────────
+# ── WebSocket tunnel ──────────────────────────────────────────────────────────
+RELAY_BUF = 64 * 1024
+
 async def parse_vless_header(first_chunk: bytes):
-    if len(first_chunk) < 24: raise ValueError("chunk too small")
-    pos = 1 + 16 # Skip version and UUID
+    if len(first_chunk) < 24:
+        raise ValueError("chunk too small")
+    pos = 1 + 16
     addon_len = first_chunk[pos]
     pos += 1 + addon_len
     command = first_chunk[pos]
@@ -1660,49 +1766,11 @@ async def parse_vless_header(first_chunk: bytes):
     elif addr_type == 3:
         addr_bytes = first_chunk[pos:pos + 16]
         pos += 16
-        address = socket.inet_ntop(socket.AF_INET6, addr_bytes)
+        address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))
     else:
         raise ValueError(f"unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
-async def parse_trojan_header(first_chunk: bytes, expected_uuid: str):
-    # Trojan password is the UUID. The client sends Hex(SHA224(UUID))
-    expected_hash = hashlib.sha224(expected_uuid.encode()).hexdigest().encode()
-    if not first_chunk.startswith(expected_hash):
-        raise ValueError("Invalid Trojan password/hash")
-    
-    pos = 56
-    if first_chunk[pos:pos+2] != b"\r\n": raise ValueError("Invalid Trojan header (no CRLF after hash)")
-    pos += 2
-    command = first_chunk[pos]
-    if command != 1: raise ValueError(f"Unsupported Trojan command: {command}")
-    pos += 1
-    atyp = first_chunk[pos]
-    pos += 1
-    if atyp == 1:
-        addr_bytes = first_chunk[pos:pos+4]
-        address = ".".join(str(b) for b in addr_bytes)
-        pos += 4
-    elif atyp == 3:
-        domain_len = first_chunk[pos]
-        pos += 1
-        address = first_chunk[pos:pos+domain_len].decode("utf-8", errors="ignore")
-        pos += domain_len
-    elif atyp == 4:
-        addr_bytes = first_chunk[pos:pos+16]
-        address = socket.inet_ntop(socket.AF_INET6, addr_bytes)
-        pos += 16
-    else:
-        raise ValueError(f"Unknown Trojan ATYP: {atyp}")
-    
-    port = int.from_bytes(first_chunk[pos:pos+2], "big")
-    pos += 2
-    if first_chunk[pos:pos+2] != b"\r\n": raise ValueError("Invalid Trojan header (no CRLF after port)")
-    pos += 2
-    
-    return command, address, port, first_chunk[pos:]
-
-# ── Tunnel Core ───────────────────────────────────────────────────────────────
 def _normalize_daily_usage(link: dict) -> None:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if link.get("daily_usage_date") != today:
@@ -1712,12 +1780,16 @@ def _normalize_daily_usage(link: dict) -> None:
 async def check_quota(uid: str, extra_bytes: int) -> bool:
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link is None or not link["active"]: return False
+        if link is None or not link["active"]:
+            return False
         expires_at = parse_expires_at(link.get("expires_at"))
-        if expires_at is not None and expires_at < datetime.now(timezone.utc): return False
+        if expires_at is not None and expires_at < datetime.now(timezone.utc):
+            return False
         _normalize_daily_usage(link)
-        if link.get("limit_bytes", 0) > 0 and (link.get("used_bytes", 0) + extra_bytes) > link.get("limit_bytes", 0): return False
-        if link.get("daily_limit_bytes", 0) > 0 and (link.get("daily_used_bytes", 0) + extra_bytes) > link.get("daily_limit_bytes", 0): return False
+        if link.get("limit_bytes", 0) > 0 and (link.get("used_bytes", 0) + extra_bytes) > link.get("limit_bytes", 0):
+            return False
+        if link.get("daily_limit_bytes", 0) > 0 and (link.get("daily_used_bytes", 0) + extra_bytes) > link.get("daily_limit_bytes", 0):
+            return False
         return True
 
 async def add_usage(uid: str, n: int):
@@ -1732,9 +1804,11 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
     try:
         while True:
             msg = await websocket.receive()
-            if msg["type"] == "websocket.disconnect": break
+            if msg["type"] == "websocket.disconnect":
+                break
             data = msg.get("bytes") or (msg.get("text") or "").encode()
-            if not data: continue
+            if not data:
+                continue
             size = len(data)
             if not await check_quota(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded")
@@ -1742,51 +1816,67 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             stats["total_bytes"] += size
             stats["total_requests"] += 1
             async with connections_lock:
-                if conn_id in connections: connections[conn_id]["bytes"] += size
+                if conn_id in connections:
+                    connections[conn_id]["bytes"] += size
             hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
             daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
             await add_usage(link_uid, size)
             try:
                 writer.write(data)
                 await writer.drain()
-            except Exception: break
-    except WebSocketDisconnect: pass
-    except Exception: pass
+            except Exception:
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
     finally:
         try:
-            if not writer.is_closing(): writer.write_eof()
-        except Exception: pass
+            if not writer.is_closing():
+                writer.write_eof()
+        except Exception:
+            pass
 
-async def tcp_to_ws(websocket, reader, conn_id, link_uid, is_vless: bool):
+async def tcp_to_ws(websocket, reader, conn_id, link_uid):
     first = True
     try:
         while True:
             data = await reader.read(RELAY_BUF)
-            if not data: break
+            if not data:
+                break
             size = len(data)
             if not await check_quota(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
             stats["total_bytes"] += size
             async with connections_lock:
-                if conn_id in connections: connections[conn_id]["bytes"] += size
+                if conn_id in connections:
+                    connections[conn_id]["bytes"] += size
             hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
             daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
             await add_usage(link_uid, size)
             try:
-                # VLESS requires 0x00 0x00 padding on first response, Trojan does not
-                if first and is_vless:
-                    await websocket.send_bytes(b"\x00\x00" + data)
-                else:
-                    await websocket.send_bytes(data)
+                await websocket.send_bytes((b"\x00\x00" + data) if first else data)
                 first = False
-            except Exception: break
-    except Exception: pass
+            except Exception:
+                break
+    except Exception:
+        pass
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
     await ensure_default_link()
 
+    # IMPORTANT: all validation that doesn't require reading client data
+    # happens BEFORE accept(). Calling websocket.close() before accept()
+    # makes the ASGI server reply with a plain HTTP 403 instead of
+    # completing the WebSocket upgrade (101) and then dropping the
+    # connection. The latter is a strong, easily-scriptable fingerprint
+    # for active-probing systems: "this server fully completes a WS
+    # handshake for literally any /ws/<uuid> path, then closes it" is
+    # exactly the kind of behavior DPI/censor probes look for. Rejecting
+    # pre-handshake makes invalid requests look like a normal closed/
+    # forbidden endpoint instead of a live VLESS server.
     async with LINKS_LOCK:
         link_data = LINKS.get(uuid)
         if link_data is None or not link_data["active"]:
@@ -1810,28 +1900,18 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
     writer = None
     conn_id = None
     client_ip = get_client_ip(websocket)
-    is_vless = True
     try:
         first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
-        if first_msg["type"] == "websocket.disconnect": return
+        if first_msg["type"] == "websocket.disconnect":
+            return
         first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not first_chunk: return
+        if not first_chunk:
+            return
 
-        allowed_protocols = link_data_copy.get("protocols", ["vless"])
-        
         try:
-            # VLESS header starts with version byte (0x00). 
-            # Trojan header starts with Hex(SHA224) which is an ascii char.
-            if first_chunk[0] == 0:
-                if "vless" not in allowed_protocols: raise ValueError("VLESS not allowed")
-                is_vless = True
-                command, address, port, initial_payload = await parse_vless_header(first_chunk)
-            else:
-                if "trojan" not in allowed_protocols: raise ValueError("Trojan not allowed")
-                is_vless = False
-                command, address, port, initial_payload = await parse_trojan_header(first_chunk, uuid)
+            command, address, port, initial_payload = await parse_vless_header(first_chunk)
         except ValueError as e:
-            logger.warning(f"Invalid Header for UUID {uuid}: {e}")
+            logger.warning(f"Invalid VLESS header: {e}")
             await websocket.close(code=1008, reason="invalid header")
             return
 
@@ -1849,35 +1929,43 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         stats["total_bytes"] += size
         stats["total_requests"] += 1
         async with connections_lock:
-            if conn_id in connections: connections[conn_id]["bytes"] += size
+            if conn_id in connections:
+                connections[conn_id]["bytes"] += size
         hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
         daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
         await add_usage(uuid, size)
 
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(address, port), timeout=10.0
+        )
 
         if initial_payload:
             p_size = len(initial_payload)
             stats["total_bytes"] += p_size
             async with connections_lock:
-                if conn_id in connections: connections[conn_id]["bytes"] += p_size
+                if conn_id in connections:
+                    connections[conn_id]["bytes"] += p_size
             hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += p_size
             daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += p_size
             await add_usage(uuid, p_size)
             try:
                 writer.write(initial_payload)
                 await writer.drain()
-            except Exception: pass
+            except Exception:
+                pass
 
         task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
-        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid, is_vless))
+        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
         done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
-            try: await t
-            except asyncio.CancelledError: pass
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
-    except WebSocketDisconnect: pass
+    except WebSocketDisconnect:
+        pass
     except Exception as exc:
         stats["total_errors"] += 1
         error_logs.append({"error": str(exc), "time": datetime.now(timezone.utc).isoformat()})
@@ -1887,7 +1975,8 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception: pass
+            except Exception:
+                pass
         if conn_id:
             async with connections_lock:
                 info = connections.pop(conn_id, None)
@@ -1896,11 +1985,15 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                     uid = info.get("uuid")
                     ip = info.get("ip")
                     if uid and ip:
-                        has_other = any(c.get("uuid") == uid and c.get("ip") == ip for c in connections.values())
+                        has_other = any(
+                            c.get("uuid") == uid and c.get("ip") == ip
+                            for c in connections.values()
+                        )
                         if not has_other:
                             if uid in link_ip_map:
                                 link_ip_map[uid].discard(ip)
-                                if not link_ip_map[uid]: link_ip_map.pop(uid, None)
+                                if not link_ip_map[uid]:
+                                    link_ip_map.pop(uid, None)
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
@@ -2001,7 +2094,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .tbl tr:hover{background:rgba(255,255,255,.06)}
 .tag{display:inline-flex;align-items:center;padding:5px 12px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
 .tag-vless{background:rgba(255,209,102,.12);color:var(--gold);border:1px solid rgba(255,209,102,.18)}
-.tag-trojan{background:rgba(74,222,128,.12);color:var(--green);border:1px solid rgba(74,222,128,.2)}
 .tag-port{background:rgba(167,139,250,.12);color:#d8b4fe;border:1px solid rgba(167,139,250,.2)}
 .tag-on{background:rgba(74,222,128,.12);color:var(--green);border:1px solid rgba(74,222,128,.2)}
 .tag-off{background:rgba(248,113,113,.12);color:var(--pink);border:1px solid rgba(248,113,113,.2)}
@@ -2030,13 +2122,12 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .act-sub{background:rgba(74,222,128,.14);color:var(--green);border-color:rgba(74,222,128,.2)}
 .act-qr{background:rgba(167,139,250,.16);color:#d8b4fe;border-color:rgba(167,139,250,.24)}
 .act-edit{background:rgba(255,209,102,.12);color:var(--gold);border-color:rgba(255,209,102,.2)}
-.act-rotate{background:rgba(56,189,248,.12);color:#38bdf8;border-color:rgba(56,189,248,.2)}
 .act-del{background:rgba(248,113,113,.14);color:var(--pink);border-color:rgba(248,113,113,.22)}
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(18px);background:rgba(15,19,34,0.95);color:var(--text);border:1px solid rgba(255,255,255,.16);border-radius:18px;padding:14px 22px;font-size:13px;font-weight:700;opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(24px);box-shadow:0 32px 80px rgba(0,0,0,.25)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .mo{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(14px)}
 .mo.show{display:flex}
-.mo-box{background:rgba(9,12,21,0.96);border:1px solid rgba(255,255,255,.16);border-radius:28px;padding:28px;width:100%;max-width:520px;position:relative;box-shadow:0 40px 100px rgba(0,0,0,.35);transform:scale(.94);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1);backdrop-filter:blur(24px); max-height: 90vh; overflow-y: auto;}
+.mo-box{background:rgba(9,12,21,0.96);border:1px solid rgba(255,255,255,.16);border-radius:28px;padding:28px;width:100%;max-width:520px;position:relative;box-shadow:0 40px 100px rgba(0,0,0,.35);transform:scale(.94);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1);backdrop-filter:blur(24px)}
 .mo.show .mo-box{transform:scale(1);opacity:1}
 .mo-title{font-family:'Nunito Sans','Vazirmatn',sans-serif;font-size:14px;font-weight:800;margin-bottom:18px;color:#d8b4ff;letter-spacing:.08em}
 .mo-close{position:absolute;top:16px;right:16px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:var(--text3);width:36px;height:36px;border-radius:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px}
@@ -2068,9 +2159,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .login-logo{text-align:center;margin-bottom:34px}
 .login-title{font-family:'Nunito Sans','Vazirmatn',sans-serif;font-size:34px;font-weight:900;background:linear-gradient(90deg,#70d6ff,#a855f7);-webkit-background-clip:text;color:transparent;letter-spacing:.14em}
 .login-sub{font-size:13px;color:var(--text3);margin-top:12px}
-.proto-checks { display: flex; gap: 12px; margin-top: 5px; }
-.proto-checks label { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; cursor: pointer; color: var(--text); }
-.proto-checks input { cursor: pointer; accent-color: var(--gold); }
 @media(max-width:768px){
   .mob-hd{display:flex;height:78px;padding:0 20px;}
   .mob-tl-group .lang-btn{font-size:13px;padding:7px 12px;border-radius:999px;}
@@ -2185,8 +2273,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <span class="nav-label" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
       </button>
       <button class="nav-item" data-page="settings">
-        <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor">
-        <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-2 13.5l103 78-110 190-118-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 42q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 64q-5 15-7 30t-2 32q0 16 2 31t7 30l-86 65 39 68 99-42q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z" />
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m10.5 2 1.1 3.3a2.2 2.2 0 0 0 1.7 1.5l3.4.5-2.4 2.3a2.2 2.2 0 0 0-.6 1.9l.6 3.4-3.1-1.6a2.2 2.2 0 0 0-2.1 0l-3.1 1.6.6-3.4a2.2 2.2 0 0 0-.6-1.9L4.3 7.3l3.4-.5a2.2 2.2 0 0 0 1.7-1.5L10.5 2Z"/><path d="M19 15a4 4 0 1 1 0-8 4 4 0 0 1 0 8Z"/></svg>
         <span class="nav-label" data-en="Settings" data-fa="تنظیمات">Settings</span>
       </button>
       <button class="nav-item logout-mob" onclick="doLogout()">
@@ -2255,7 +2342,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="page-header">
         <div>
           <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
-          <div class="page-sub" data-en="VLESS & Trojan over WebSocket" data-fa="VLESS و Trojan روی WebSocket">VLESS & Trojan over WebSocket</div>
+          <div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div>
         </div>
         <button class="btn btn-gold" onclick="showAddMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
       </div>
@@ -2276,7 +2363,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
             <thead><tr>
               <th data-en="#" data-fa="#">#</th>
               <th data-en="Name" data-fa="نام">Name</th>
-              <th data-en="Type" data-fa="پروتکل">Type</th>
+              <th data-en="Type" data-fa="نوع">Type</th>
               <th data-en="Usage" data-fa="مصرف">Usage</th>
               <th data-en="IPs" data-fa="آی‌پی">IPs</th>
               <th data-en="Expiry" data-fa="انقضا">Expiry</th>
@@ -2336,30 +2423,18 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="page-header"><div><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div><div class="page-sub" data-en="Bot, naming template & password" data-fa="ربات، قالب نام‌گذاری و رمز عبور">Bot, naming template & password</div></div></div>
       <div class="grid-2">
         <div class="card">
-          <div class="card-hd"><div class="card-title" data-en="Config Name Template & Port" data-fa="قالب نام و پورت کانفیگ">Config Name Template & Port</div></div>
-          <div class="fg"><label class="fl" data-en="Config Name Template" data-fa="قالب نام کانفیگ">Config Name Template</label><input class="fi" type="text" id="cfg-template" placeholder="{IP}-{USER}-{PORT}-{INDEX}"></div>
-          <div class="fg"><label class="fl" data-en="Config Port" data-fa="پورت کانفیگ">Config Port</label><select class="fs" id="cfg-port"><option value="443">443</option><option value="2053">2053</option><option value="2083">2083</option><option value="2087">2087</option><option value="2096">2096</option><option value="8443">8443</option><option value="80">80</option><option value="8080">8080</option><option value="8880">8880</option><option value="2052">2052</option><option value="2082">2082</option><option value="2086">2086</option><option value="2095">2095</option></select></div>
-          <div style="font-size:12px;color:var(--text3);margin-top:6px;line-height:1.5" data-en="Use: {INDEX}, {PORT}, {USER}, {IP}" data-fa="از: {INDEX}، {PORT}، {USER}، {IP}">Use: {INDEX}, {PORT}, {USER}, {IP}</div>
-          <button class="btn btn-gold" onclick="saveConfigSettings()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Save Template Settings" data-fa="ذخیره تنظیمات کانفیگ">Save Template Settings</button>
-        </div>
-        <div class="card">
           <div class="card-hd"><div class="card-title" data-en="Telegram Bot Settings" data-fa="تنظیمات ربات تلگرام">Telegram Bot Settings</div></div>
           <div class="fg"><label class="fl" data-en="Telegram Bot Token" data-fa="توکن ربات تلگرام">Bot Token</label><input class="fi" type="text" id="tg-token" placeholder="123456:ABC-DEF..."></div>
           <div class="fg"><label class="fl" data-en="Telegram Admin ID" data-fa="شناسه عددی ادمین">Admin Chat ID</label><input class="fi" type="text" id="tg-admin-id" placeholder="987654321"></div>
-          <button class="btn btn-gold" onclick="saveBotSettings()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Save Bot Settings" data-fa="ذخیره تنظیمات ربات">Save Bot Settings</button>
+          <div class="fg"><label class="fl" data-en="Config Name Template" data-fa="قالب نام کانفیگ">Config Name Template</label><input class="fi" type="text" id="cfg-template" placeholder="{IP}-{USER}-{PORT}-{INDEX}"></div>
+          <div style="font-size:12px;color:var(--text3);margin-top:6px;line-height:1.5" data-en="Use: {INDEX}, {PORT}, {USER}, {IP}" data-fa="از: {INDEX}، {PORT}، {USER}، {IP}">Use: {INDEX}, {PORT}, {USER}, {IP}</div>
+          <button class="btn btn-gold" onclick="saveSettings()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Save Bot Settings" data-fa="ذخیره تنظیمات ربات">Save Bot Settings</button>
         </div>
-      </div>
-      <div class="grid-2">
         <div class="card">
           <div class="card-hd"><div class="card-title" data-en="Change Password" data-fa="تغییر رمز عبور">Change Password</div></div>
           <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw" data-ph-en="Current password" data-ph-fa="رمز فعلی" placeholder="Current password"></div>
           <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw" data-ph-en="Min 4 chars" data-ph-fa="حداقل ۴ کاراکتر" placeholder="Min 4 chars"></div>
           <button class="btn btn-gold" onclick="chgPw()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
-        </div>
-        <div class="card">
-          <div class="card-hd"><div class="card-title" data-en="UUID Management" data-fa="مدیریت UUID">UUID Management</div></div>
-          <div style="font-size:13px;color:var(--text2);margin-bottom:12px" data-en="Rotate the default config UUID for all active inbounds." data-fa="UUID کانفیگ‌های پیش‌فرض را برای همه اینباندهای فعال تغییر دهید.">Rotate the default config UUID for all active inbounds.</div>
-          <button class="btn btn-gold" onclick="rotateAllUUIDs()" style="width:100%;justify-content:center;" data-en="Rotate Default UUIDs" data-fa="تعویض UUID پیش‌فرض">Rotate Default UUIDs</button>
         </div>
       </div>
       <div class="card" style="margin-top: 14px;">
@@ -2389,17 +2464,8 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="fg"><label class="fl" data-en="Expiry" data-fa="انقضا">Expiry</label><input class="fi" id="ne" type="number" min="0" step="1" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
       <div class="fg" style="max-width:120px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu2"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></div>
     </div>
-    <div class="fr">
-      <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-      <div class="fg"><label class="fl" data-en="Clean IP Count" data-fa="تعداد آی‌پی تمیز">Clean IP Count</label><input class="fi" id="ncip" type="number" min="0" data-ph-en="0 = none" data-ph-fa="۰ = بدون انتخاب" placeholder="0 = none"></div>
-    </div>
-    <div class="fg">
-      <label class="fl" data-en="Protocols" data-fa="پروتکل‌ها">Protocols</label>
-      <div class="proto-checks">
-        <label><input type="checkbox" id="chk-vless-add" checked> VLESS</label>
-        <label><input type="checkbox" id="chk-trojan-add" checked> Trojan</label>
-      </div>
-    </div>
+    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl" data-en="Clean IP Count" data-fa="تعداد آی‌پی تمیز">Clean IP Count</label><input class="fi" id="ncip" type="number" min="0" data-ph-en="0 = none" data-ph-fa="۰ = بدون انتخاب" placeholder="0 = none"></div>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
   </div>
 </div>
@@ -2423,13 +2489,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="fg" style="max-width:120px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu3"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></div>
     </div>
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-    <div class="fg">
-      <label class="fl" data-en="Protocols" data-fa="پروتکل‌ها">Protocols</label>
-      <div class="proto-checks">
-        <label><input type="checkbox" id="chk-vless-edit"> VLESS</label>
-        <label><input type="checkbox" id="chk-trojan-edit"> Trojan</label>
-      </div>
-    </div>
     <div style="display:flex;gap:10px;margin-top:16px">
       <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center;padding:12px;" data-en="SAVE" data-fa="ذخیره">SAVE</button>
       <button class="btn btn-danger" onclick="resetTraf()" style="padding:12px;" data-en="Reset" data-fa="بازنشانی ترافیک">Reset</button>
@@ -2464,8 +2523,8 @@ function $m(id){return document.getElementById(id);}
 function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 const langMap={
-  en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',rotate:'Rotate',del:'Del'},
-  fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',rotate:'تعویض',del:'حذف'}
+  en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},
+  fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}
 };
 function tr(key){return(langMap[lang]&&langMap[lang][key])||langMap['en'][key]||key;}
 
@@ -2478,8 +2537,10 @@ let tChart=null;
 let iChart=null;
 let allAddrs=[];
 let isAuthenticated=false;
+let defaultPort=443;
 let logsWS=null;
 
+// ── Theme ────────────────────────────────────────────────────────────────────
 function setTheme(t){
   theme=t;
   if(t==='light')document.body.classList.add('light-mode');
@@ -2494,6 +2555,7 @@ function setTheme(t){
 }
 function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
 
+// ── Lang ─────────────────────────────────────────────────────────────────────
 function setLang(l){
   lang=l;
   document.querySelectorAll('.lang-en').forEach(e=>e.classList.toggle('active',l==='en'));
@@ -2511,6 +2573,7 @@ function setLang(l){
   filterLinks();
 }
 
+// ── Live Logs WebSocket ───────────────────────────────────────────────────────
 function connectLogsWS(){
   if(logsWS) { try { logsWS.close(); } catch(e){} }
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -2532,6 +2595,7 @@ function connectLogsWS(){
   };
 }
 
+// ── Auth ─────────────────────────────────────────────────────────────────────
 async function checkAuth(){
   try{
     const r=await fetch('/api/me');
@@ -2585,6 +2649,7 @@ async function doLogout(){
   showLogin();
 }
 
+// ── Navigation ───────────────────────────────────────────────────────────────
 document.querySelectorAll('.nav-item[data-page]').forEach(el=>{
   el.addEventListener('click',()=>switchPage(el.dataset.page));
 });
@@ -2596,6 +2661,7 @@ function switchPage(id){
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
 }
 
+// ── Toast ─────────────────────────────────────────────────────────────────────
 function toast(msg,err=false){
   const t=$m('toast');
   t.textContent=msg;
@@ -2604,6 +2670,7 @@ function toast(msg,err=false){
   t._hide=setTimeout(()=>t.classList.remove('show'),3000);
 }
 
+// ── Format helpers ────────────────────────────────────────────────────────────
 function fmtB(b){
   if(!b||b===0)return'0 B';
   return b>=1073741824?(b/1073741824).toFixed(2)+' GB':
@@ -2626,6 +2693,7 @@ function fmtExp(ea){
   return Math.floor(d/60000)+'m';
 }
 
+// ── Links ─────────────────────────────────────────────────────────────────────
 function setFilter(filter,el){
   cf=filter;
   document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
@@ -2714,27 +2782,19 @@ function renderLinks(links){
     const i=idx--;
     const cc=l.current_connections||0;
     const mc2=l.max_connections||0;
-    const protos = l.protocols || ["vless"];
-    const pTags = protos.map(p => {
-        if(p === 'vless') return '<span class="tag tag-vless">VLESS</span>';
-        if(p === 'trojan') return '<span class="tag tag-trojan">TROJAN</span>';
-        return '';
-    }).join(' ');
-    
-    return{l,pct,col,ex,ec,i,cc,mc2,u,lim,pTags};
+    return{l,pct,col,ex,ec,i,cc,mc2,u,lim};
   });
 
   const editText=tr('edit');
   const copyText=tr('copy');
   const subText=tr('sub');
   const qrText=tr('qr');
-  const rotateText=tr('rotate');
   const delText=tr('del');
 
   tb.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
     <td style="font-weight:600">${esc(r.l.label)}</td>
-    <td><div style="display:flex;gap:4px;">${r.pTags}</div></td>
+    <td><span class="tag tag-vless">VLESS</span></td>
     <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
     <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
     <td style="font-size:10.5px;font-weight:700;color:${r.ec}">${r.ex}</td>
@@ -2744,7 +2804,6 @@ function renderLinks(links){
       <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">${editText}</button>
       <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
       <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
-      <button class="act-btn act-rotate" onclick="rotateUUID('${r.l.uuid}')">${rotateText}</button>
       <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div></td>
@@ -2755,7 +2814,7 @@ function renderLinks(links){
       <div style="display:flex;align-items:center;gap:7px">
         <span style="font-size:11px;color:var(--text3)">#${r.i}</span>
         <span style="font-weight:600;font-size:14px">${esc(r.l.label)}</span>
-        ${r.pTags}
+        <span class="tag tag-vless">VLESS</span>
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
@@ -2765,7 +2824,6 @@ function renderLinks(links){
       <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">${editText}</button>
       <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
       <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
-      <button class="act-btn act-rotate" onclick="rotateUUID('${r.l.uuid}')">${rotateText}</button>
       <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div>
@@ -2792,11 +2850,7 @@ async function togLink(el){
   }catch(e){toast('Failed to toggle',true);}
 }
 
-function showAddMo(){
-  $m('chk-vless-add').checked = true;
-  $m('chk-trojan-add').checked = true;
-  $m('mo-add').classList.add('show');
-}
+function showAddMo(){$m('mo-add').classList.add('show');}
 
 async function createLink(){
   const label=$m('nl').value.trim()||'New Link';
@@ -2809,12 +2863,6 @@ async function createLink(){
   const expiryUnit=$m('nu2').value||'days';
   const mc=parseInt($m('nc').value)||0;
   const cleanIpCount=parseInt($m('ncip').value)||0;
-  
-  let protocols = [];
-  if($m('chk-vless-add').checked) protocols.push("vless");
-  if($m('chk-trojan-add').checked) protocols.push("trojan");
-  if(protocols.length === 0){ toast('Select at least one protocol',true); return; }
-
   try{
     const r=await fetch('/api/links',{
       method:'POST',
@@ -2828,8 +2876,7 @@ async function createLink(){
         expiry_value:expiryValue,
         expiry_unit:expiryUnit,
         max_connections:mc,
-        clean_ip_count:cleanIpCount,
-        protocols: protocols
+        clean_ip_count:cleanIpCount
       })
     });
     if(!r.ok)throw new Error();
@@ -2853,11 +2900,6 @@ function showEditMo(uid){
   $m('ec').value=l.max_connections>0?l.max_connections:'';
   $m('ed').value='';
   $m('eu3').value='days';
-  
-  const protos = l.protocols || ["vless"];
-  $m('chk-vless-edit').checked = protos.includes("vless");
-  $m('chk-trojan-edit').checked = protos.includes("trojan");
-
   $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
   $m('mo-edit').classList.add('show');
 }
@@ -2875,18 +2917,26 @@ async function saveEdit(){
   const expiryUnit=$m('eu3').value||'days';
   const mcRaw=$m('ec').value;
   const mc=parseInt(mcRaw);
-  
-  let protocols = [];
-  if($m('chk-vless-edit').checked) protocols.push("vless");
-  if($m('chk-trojan-edit').checked) protocols.push("trojan");
-  if(protocols.length === 0){ toast('Select at least one protocol',true); return; }
-
-  const body={ protocols: protocols };
-  if(vRaw !== '' && !Number.isNaN(v)){ body.limit_value=v; body.limit_unit=limitUnit; }
-  if(dailyRaw !== '' && !Number.isNaN(dailyValue)){ body.daily_limit_value=dailyValue; body.daily_limit_unit=dailyUnit; }
-  if(expiryRaw !== '' && !Number.isNaN(expiryValue)){ body.expiry_value=expiryValue; body.expiry_unit=expiryUnit; }
-  if(mcRaw !== '' && !Number.isNaN(mc)){ body.max_connections=mc; }
-  
+  const body={};
+  if(vRaw !== '' && !Number.isNaN(v)){
+    body.limit_value=v;
+    body.limit_unit=limitUnit;
+  }
+  if(dailyRaw !== '' && !Number.isNaN(dailyValue)){
+    body.daily_limit_value=dailyValue;
+    body.daily_limit_unit=dailyUnit;
+  }
+  if(expiryRaw !== '' && !Number.isNaN(expiryValue)){
+    body.expiry_value=expiryValue;
+    body.expiry_unit=expiryUnit;
+  }
+  if(mcRaw !== '' && !Number.isNaN(mc)){
+    body.max_connections=mc;
+  }
+  if(Object.keys(body).length === 0){
+    toast('No changes to save', true);
+    return;
+  }
   try{
     const r=await fetch('/api/links/'+uid,{
       method:'PATCH',
@@ -2938,26 +2988,6 @@ async function cpSub(uid){
   }catch(e){toast('Failed to copy',true);}
 }
 
-async function rotateUUID(uid){
-  if(!confirm('Rotate this inbound UUID?'))return;
-  try{
-    const r = await fetch('/api/links/'+uid+'/rotate-uuid',{method:'POST'});
-    if(!r.ok)throw new Error();
-    toast('UUID rotated');
-    await loadLinks();
-  }catch(e){toast('Failed to rotate UUID',true);}
-}
-
-async function rotateAllUUIDs(){
-  if(!confirm('Rotate all inbound UUIDs?'))return;
-  try{
-    const r = await fetch('/api/links/rotate-uuids',{method:'POST'});
-    if(!r.ok)throw new Error();
-    toast('Default UUIDs rotated');
-    await loadLinks();
-  }catch(e){toast('Failed to rotate UUIDs',true);}
-}
-
 function showQR(txt){
   if(!txt){toast('No QR data',true);return;}
   $m('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);
@@ -2980,19 +3010,19 @@ async function loadSettings(){
       $m('tg-token').value = d.telegram_token || '';
       $m('tg-admin-id').value = d.telegram_admin_id || '';
       $m('cfg-template').value = d.config_name_template || '{IP}-{USER}-{PORT}-{INDEX}';
-      $m('cfg-port').value = d.config_port || 443;
     }
   } catch(e){}
 }
 
-async function saveBotSettings(){
+async function saveSettings(){
   const tok = $m('tg-token').value.trim();
   const adm = $m('tg-admin-id').value.trim();
+  const cfg = $m('cfg-template').value.trim() || '{IP}-{USER}-{PORT}-{INDEX}';
   try {
-    const r = await fetch('/api/settings/bot', {
+    const r = await fetch('/api/settings', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({telegram_token: tok, telegram_admin_id: adm})
+      body: JSON.stringify({telegram_token: tok, telegram_admin_id: adm, config_name_template: cfg})
     });
     if (r.ok) {
       toast('Bot settings saved & restarted');
@@ -3000,23 +3030,6 @@ async function saveBotSettings(){
       toast('Failed to save settings', true);
     }
   } catch(e){toast('Error saving settings', true);}
-}
-
-async function saveConfigSettings(){
-  const cfg = $m('cfg-template').value.trim() || '{IP}-{USER}-{PORT}-{INDEX}';
-  const port = parseInt($m('cfg-port').value, 10) || 443;
-  try {
-    const r = await fetch('/api/settings/config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({config_name_template: cfg, config_port: port})
-    });
-    if (r.ok) {
-      toast('Template settings saved');
-    } else {
-      toast('Failed to save template', true);
-    }
-  } catch(e){toast('Error saving template', true);}
 }
 
 async function loadStats(){
