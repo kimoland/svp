@@ -19,7 +19,6 @@ import uvicorn
 import httpx
 import logging
 import psutil
-
 try:
     import telebot
     from telebot.async_telebot import AsyncTeleBot
