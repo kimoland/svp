@@ -8,11 +8,12 @@ import time
 import re
 import random
 import base64
+import uuid
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import Response, HTMLResponse, JSONResponse
+from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
@@ -58,6 +59,7 @@ CONFIG = {
     "bot_lang": "en",
     "cookie_secure": os.environ.get("COOKIE_SECURE", "auto").lower(),
     "config_name_template": os.environ.get("CONFIG_NAME_TEMPLATE", "sLv-{USER}-{INDEX}"),
+    "panel_path": os.environ.get("PANEL_PATH", "/login"),
 }
 LOGIN_FAILED_MAX = int(os.environ.get("LOGIN_FAILED_MAX", 5))
 LOGIN_FAILED_WINDOW = int(os.environ.get("LOGIN_FAILED_WINDOW", 300))
@@ -340,6 +342,7 @@ def save_db():
         "telegram_admin_id": CONFIG["telegram_admin_id"],
         "bot_lang": CONFIG["bot_lang"],
         "config_name_template": CONFIG["config_name_template"],
+        "panel_path": CONFIG.get("panel_path", "/login"),
     }
     tmp_path = DB_TMP_FILE
     try:
@@ -383,6 +386,7 @@ def load_db():
         CONFIG["telegram_admin_id"] = data.get("telegram_admin_id", "")
         CONFIG["bot_lang"] = data.get("bot_lang", "en") if data.get("bot_lang") in ("en", "fa") else "en"
         CONFIG["config_name_template"] = data.get("config_name_template") or os.environ.get("CONFIG_NAME_TEMPLATE", "sLv-{USER}-{INDEX}")
+        CONFIG["panel_path"] = data.get("panel_path") or os.environ.get("PANEL_PATH", "/login")
         restore_admin_password_if_needed()
     except Exception as e:
         logger.error(f"Error loading DB: {e}")
@@ -496,8 +500,8 @@ def get_domain() -> str:
         .replace("https://", "").replace("http://", "")
     )
 
-def build_config_name(link_label: str | None, uid: str, address: str | None = None, port: int | None = None, index: int | None = None) -> str:
-    template = (CONFIG.get("config_name_template") or "sLv-{USER}-{INDEX}").strip() or "sLv-{USER}-{INDEX}"
+def build_config_name(link_label: str | None, uid: str, address: str | None = None, port: int | None = None, index: int | None = None, link_template: str | None = None) -> str:
+    template = (link_template or CONFIG.get("config_name_template") or "sLv-{USER}-{INDEX}").strip() or "sLv-{USER}-{INDEX}"
     user_value = (link_label or uid or "user").strip() or "user"
     port_value = port if port is not None else DEFAULT_PORT
     index_value = index if index is not None else 1
@@ -513,17 +517,18 @@ def build_config_name(link_label: str | None, uid: str, address: str | None = No
     return cleaned or f"sLv-{user_value}-{index_value}"
 
 
-def generate_vless_link(uuid: str, remark: str = "sLv", address: str = None, port: int = None) -> str:
+def generate_vless_link(uid: str, remark: str = "sLv", address: str = None, port: int = None) -> str:
+    real_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, uid))
     domain = get_domain()
     addr = address if address else domain
     use_port = port if port else DEFAULT_PORT
-    path = f"/ws/{uuid}"
+    path = f"/ws/{uid}"
     params = {
         "encryption": "none", "security": "tls", "type": "ws",
         "host": domain, "path": path, "sni": domain, "fp": "chrome", "alpn": "http/1.1"
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{addr}:{use_port}?{query}#{quote(remark)}"
+    return f"vless://{real_uuid}@{addr}:{use_port}?{query}#{quote(remark)}"
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -1202,6 +1207,7 @@ async def get_settings(_=Depends(require_auth)):
         "telegram_token": CONFIG["telegram_token"],
         "telegram_admin_id": CONFIG["telegram_admin_id"],
         "config_name_template": CONFIG.get("config_name_template", "sLv-{USER}-{INDEX}"),
+        "panel_path": CONFIG.get("panel_path", "/login"),
     }
 
 @app.post("/api/settings")
@@ -1222,6 +1228,20 @@ async def update_settings(request: Request, _=Depends(require_auth)):
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock:
         conn_count = len(connections)
+    # Count user states
+    active_users = 0
+    inactive_users = 0
+    expired_users = 0
+    async with LINKS_LOCK:
+        for uid, data in LINKS.items():
+            if not data.get("active", True):
+                inactive_users += 1
+            else:
+                expires_at = parse_expires_at(data.get("expires_at"))
+                if expires_at is not None and expires_at < datetime.now(timezone.utc):
+                    expired_users += 1
+                else:
+                    active_users += 1
     return {
         "active_connections": conn_count,
         "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
@@ -1235,6 +1255,9 @@ async def get_stats(_=Depends(require_auth)):
         "cpu_percent": psutil.cpu_percent(interval=0.1),
         "memory_percent": psutil.virtual_memory().percent,
         "hourly_traffic": dict(hourly_traffic),
+        "active_users": active_users,
+        "inactive_users": inactive_users,
+        "expired_users": expired_users,
     }
 
 @app.post("/api/links")
@@ -1281,6 +1304,8 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "active": True,
         "expires_at": expires_at,
+        "config_name_template": (body.get("config_name_template") or "").strip(),
+        "blacklist": body.get("blacklist", []),
     }
     if clean_ip_count > 0:
         async with CUSTOM_ADDRESSES_LOCK:
@@ -1311,6 +1336,7 @@ async def list_links(_=Depends(require_auth)):
     async with LINKS_LOCK:
         items = list(LINKS.items())
     for uid, data in items:
+        link_tpl = data.get("config_name_template") or None
         result.append({
             "uuid": uid,
             "label": data["label"],
@@ -1323,7 +1349,9 @@ async def list_links(_=Depends(require_auth)):
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=build_config_name(data.get('label'), uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT),
+            "vless_link": generate_vless_link(uid, remark=build_config_name(data.get('label'), uid, None, DEFAULT_PORT, 1, link_template=link_tpl), port=DEFAULT_PORT),
+            "config_name_template": data.get("config_name_template", ""),
+            "blacklist": data.get("blacklist", []),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -1354,6 +1382,10 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
+        if "config_name_template" in body:
+            LINKS[uid]["config_name_template"] = (str(body["config_name_template"]) or "").strip()
+        if "blacklist" in body:
+            LINKS[uid]["blacklist"] = body["blacklist"]
         if "expiry_value" in body:
             expiry_value = body.get("expiry_value")
             expiry_unit = (body.get("expiry_unit") or "days").lower()
@@ -1438,6 +1470,56 @@ async def delete_address(index: int, _=Depends(require_auth)):
     save_db()
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
+# ── UUID Change ───────────────────────────────────────────────────────────────
+@app.patch("/api/links/{uid}/uuid")
+async def change_link_uuid(uid: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    new_uuid = (body.get("new_uuid") or "").strip()
+    if not new_uuid:
+        raise HTTPException(status_code=400, detail="New UUID is required")
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', new_uuid):
+        raise HTTPException(status_code=400, detail="UUID must contain only English letters, numbers, and characters: - _ . space")
+    if len(new_uuid) > 60:
+        raise HTTPException(status_code=400, detail="UUID must be 60 characters or less")
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="Link not found")
+        if new_uuid in LINKS and new_uuid != uid:
+            raise HTTPException(status_code=400, detail="A link with this UUID already exists")
+        link_data = LINKS.pop(uid)
+        LINKS[new_uuid] = link_data
+    save_db()
+    await close_connections_for_link(uid)
+    return {"ok": True, "old_uuid": uid, "new_uuid": new_uuid}
+
+# ── Config Template Endpoint ──────────────────────────────────────────────────
+@app.post("/api/settings/config-template")
+async def save_config_template(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    template_value = (body.get("config_name_template") or "").strip()
+    if template_value:
+        CONFIG["config_name_template"] = template_value
+    else:
+        CONFIG["config_name_template"] = "sLv-{USER}-{INDEX}"
+    save_db()
+    return {"ok": True, "config_name_template": CONFIG["config_name_template"]}
+
+# ── Panel Path Endpoint ──────────────────────────────────────────────────────
+@app.post("/api/settings/panel-path")
+async def save_panel_path(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    new_path = (body.get("panel_path") or "").strip()
+    if not new_path:
+        new_path = "/login"
+    if not new_path.startswith("/"):
+        new_path = "/" + new_path
+    new_path = re.sub(r'[^a-zA-Z0-9/_\-]', '', new_path)
+    if not new_path or new_path == "/":
+        new_path = "/login"
+    CONFIG["panel_path"] = new_path
+    save_db()
+    return {"ok": True, "panel_path": CONFIG["panel_path"]}
+
 # ── Live Logs WebSocket ───────────────────────────────────────────────────────
 @app.websocket("/ws/live-logs")
 async def ws_live_logs(websocket: WebSocket, token: str | None = None):
@@ -1489,9 +1571,10 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
         hours = (secs_left % 86400) // 3600
         expiry_str = f"{days} Days, {hours} Hours Left"
 
-    configs = [generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT)]
+    link_tpl = link.get("config_name_template") or None
+    configs = [generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, DEFAULT_PORT, 1, link_template=link_tpl), port=DEFAULT_PORT)]
     for i, addr in enumerate(addresses):
-        configs.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, DEFAULT_PORT, i + 1), address=addr, port=DEFAULT_PORT))
+        configs.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, DEFAULT_PORT, i + 1, link_template=link_tpl), address=addr, port=DEFAULT_PORT))
 
     configs_json = json.dumps(configs)
 
@@ -1514,8 +1597,10 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
             font-family: 'Nunito Sans', 'Vazirmatn', sans-serif;
             color: #f5f7ff;
             background: radial-gradient(circle at 10% 15%, rgba(112,214,255,0.16), transparent 22%),
-                        radial-gradient(circle at 85% 10%, rgba(168,85,247,0.14), transparent 15%),
-                        linear-gradient(135deg, #05070f 0%, #0e1326 100%);
+                        radial-gradient(circle at 80% 10%, rgba(168,85,247,0.14), transparent 12%),
+                        radial-gradient(circle at 80% 80%, rgba(255,160,75,0.10), transparent 18%),
+                        linear-gradient(180deg, #05070f 0%, #0e1326 100%);
+            transition: background 0.4s, color 0.4s;
         }}
         .shell {{
             width: 100%;
@@ -1689,9 +1774,10 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
     status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0", port=DEFAULT_PORT)
     links_out = [status_node]
     
-    links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, DEFAULT_PORT, 1), port=DEFAULT_PORT))
+    link_tpl = link.get("config_name_template") or None
+    links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, None, DEFAULT_PORT, 1, link_template=link_tpl), port=DEFAULT_PORT))
     for i, addr in enumerate(addresses):
-        links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, DEFAULT_PORT, i + 1), address=addr, port=DEFAULT_PORT))
+        links_out.append(generate_vless_link(uid, remark=build_config_name(link.get('label'), uid, addr, DEFAULT_PORT, i + 1, link_template=link_tpl), address=addr, port=DEFAULT_PORT))
             
     return "\n".join(links_out)
 
@@ -1912,6 +1998,12 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         except ValueError as e:
             logger.warning(f"Invalid VLESS header: {e}")
             await websocket.close(code=1008, reason="invalid header")
+            return
+
+        blacklist = link_data_copy.get("blacklist", [])
+        if blacklist and any(b in address for b in blacklist if b):
+            logger.warning(f"Blocked connection to {address} for user {uuid} (Blacklisted)")
+            await websocket.close(code=1008, reason="blocked domain")
             return
 
         conn_id = secrets.token_urlsafe(8)
@@ -2272,9 +2364,11 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <span class="nav-label" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
       </button>
       <button class="nav-item" data-page="settings">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m10.5 2 1.1 3.3a2.2 2.2 0 0 0 1.7 1.5l3.4.5-2.4 2.3a2.2 2.2 0 0 0-.6 1.9l.6 3.4-3.1-1.6a2.2 2.2 0 0 0-2.1 0l-3.1 1.6.6-3.4a2.2 2.2 0 0 0-.6-1.9L4.3 7.3l3.4-.5a2.2 2.2 0 0 0 1.7-1.5L10.5 2Z"/><path d="M19 15a4 4 0 1 1 0-8 4 4 0 0 1 0 8Z"/></svg>
-        <span class="nav-label" data-en="Settings" data-fa="تنظیمات">Settings</span>
-      </button>
+  <svg class="nav-icon" viewBox="0 -960 960 960" fill="currentColor">
+    <path d="M392.23-108.08 377-227.48q-16.58-5.41-34.67-15.35-18.1-9.94-31.46-21.02L201-217.77l-88.27-153.54 96-72.46q-1.57-8.59-2.06-17.1-.48-8.51-.48-18.75 0-7.73.73-16.94.74-9.21 2.12-21.29l-96.31-71.84L201-741.65l110.85 46.5q13.65-11.27 30.23-20.87 16.57-9.59 34.54-16.17l15.61-120.54h175.73l15.23 119.81q18.62 6.84 33.44 15.83 14.83 8.98 29.68 21.94l112.88-46.5 88.27 151.96-99.96 74.65q1.96 9.65 2.25 17.42.29 7.77.29 17.52 0 9.37-.39 17.53-.38 8.16-2.46 18.72l98.39 72.54-88.27 153.54-111-47.27q-13.73 11.54-28.54 20.35-14.81 8.8-34.58 16.8l-15.23 119.81H392.23Zm48.02-55.96h77.6l14.93-107.65q29.72-8 53.85-22.08 24.14-14.08 47.18-37.23l99.88 42.58 38.89-67.1L685-421q4.5-15.54 6.4-29.99 1.91-14.46 1.91-29.11 0-15.21-1.66-28.78-1.65-13.58-6.65-29.35l88.35-66.96-38.08-67.19-102.15 43.19q-18.16-19.85-46.2-36.31-28.04-16.46-54.61-23l-12.57-108.27h-79.12l-12.74 107.59q-31.61 7.72-55.51 21.18-23.91 13.46-48.56 37.81l-98.89-42.19-39.07 67.19 86.07 63.88q-5 15.04-7 30.05-2 15.01-2 31.11 0 15.03 1.75 29.53 1.75 14.5 6.37 30.43l-85.19 64.57 39.07 67.2 98.2-42q23.88 23.88 48.84 38 24.96 14.11 55.45 21.61l12.84 106.77Zm38.43-200q48.17 0 81.99-33.87 33.83-33.86 33.83-82.13 0-48.27-33.86-82.09-33.85-33.83-82.1-33.83-48.62 0-82.29 33.87-33.67 33.86-33.67 82.13 0 48.27 33.67 82.09 33.67 33.83 82.43 33.83Zm1.01-116.46Z"/>
+  </svg>
+  <span class="nav-label" data-en="Settings" data-fa="تنظیمات">Settings</span>
+</button>
       <button class="nav-item logout-mob" onclick="doLogout()">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
         <span class="nav-label" data-en="Logout" data-fa="خروج">Logout</span>
@@ -2319,6 +2413,11 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <div class="stat-card" style="animation-delay:.16s"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</div></div>
         <div class="stat-card" style="animation-delay:.24s"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:15px">–</div></div>
         <div class="stat-card" style="animation-delay:.32s"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:10px;word-break:break-all;font-weight:500">–</div></div>
+      </div>
+      <div class="stats-row" style="grid-template-columns:repeat(3,1fr)">
+        <div class="stat-card" style="animation-delay:.38s"><div class="stat-label" data-en="Active Users" data-fa="کاربران فعال">Active Users</div><div class="stat-val" id="sv-active" style="color:#4ade80">–</div></div>
+        <div class="stat-card" style="animation-delay:.44s"><div class="stat-label" data-en="Inactive Users" data-fa="کاربران غیرفعال">Inactive Users</div><div class="stat-val" id="sv-inactive" style="color:#f87171">–</div></div>
+        <div class="stat-card" style="animation-delay:.50s"><div class="stat-label" data-en="Expired Users" data-fa="کاربران منقضی">Expired Users</div><div class="stat-val" id="sv-expired" style="color:#fbbf24">–</div></div>
       </div>
       <div class="grid-2">
         <div class="card">
@@ -2419,14 +2518,12 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 
     <!-- Settings -->
     <section class="page" id="page-settings">
-      <div class="page-header"><div><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div><div class="page-sub" data-en="Bot, naming template & password" data-fa="ربات، قالب نام‌گذاری و رمز عبور">Bot, naming template & password</div></div></div>
+      <div class="page-header"><div><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div><div class="page-sub" data-en="Bot, naming template, panel path & password" data-fa="ربات، قالب نام‌گذاری، مسیر پنل و رمز عبور">Bot, naming template, panel path & password</div></div></div>
       <div class="grid-2">
         <div class="card">
           <div class="card-hd"><div class="card-title" data-en="Telegram Bot Settings" data-fa="تنظیمات ربات تلگرام">Telegram Bot Settings</div></div>
           <div class="fg"><label class="fl" data-en="Telegram Bot Token" data-fa="توکن ربات تلگرام">Bot Token</label><input class="fi" type="text" id="tg-token" placeholder="123456:ABC-DEF..."></div>
           <div class="fg"><label class="fl" data-en="Telegram Admin ID" data-fa="شناسه عددی ادمین">Admin Chat ID</label><input class="fi" type="text" id="tg-admin-id" placeholder="987654321"></div>
-          <div class="fg"><label class="fl" data-en="Config Name Template" data-fa="قالب نام کانفیگ">Config Name Template</label><input class="fi" type="text" id="cfg-template" placeholder="{IP}-{USER}-{PORT}-{INDEX}"></div>
-          <div style="font-size:12px;color:var(--text3);margin-top:6px;line-height:1.5" data-en="Use: {INDEX}, {PORT}, {USER}, {IP}" data-fa="از: {INDEX}، {PORT}، {USER}، {IP}">Use: {INDEX}, {PORT}, {USER}, {IP}</div>
           <button class="btn btn-gold" onclick="saveSettings()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Save Bot Settings" data-fa="ذخیره تنظیمات ربات">Save Bot Settings</button>
         </div>
         <div class="card">
@@ -2434,6 +2531,21 @@ body[dir="rtl"]{direction:rtl;text-align:right}
           <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw" data-ph-en="Current password" data-ph-fa="رمز فعلی" placeholder="Current password"></div>
           <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw" data-ph-en="Min 4 chars" data-ph-fa="حداقل ۴ کاراکتر" placeholder="Min 4 chars"></div>
           <button class="btn btn-gold" onclick="chgPw()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
+        </div>
+      </div>
+      <div class="grid-2" style="margin-top:14px">
+        <div class="card">
+          <div class="card-hd"><div class="card-title" data-en="Config Name Template" data-fa="قالب نام کانفیگ">Config Name Template</div></div>
+          <div class="fg"><label class="fl" data-en="Default Template" data-fa="قالب پیش‌فرض">Default Template</label><input class="fi" type="text" id="cfg-template" placeholder="{IP}-{USER}-{PORT}-{INDEX}"></div>
+          <div style="font-size:12px;color:var(--text3);margin-top:6px;line-height:1.5" data-en="Placeholders: {INDEX}, {PORT}, {USER}, {IP}" data-fa="پلیس‌هولدرها: {INDEX}، {PORT}، {USER}، {IP}">Placeholders: {INDEX}, {PORT}, {USER}, {IP}</div>
+          <button class="btn btn-gold" onclick="saveConfigTemplate()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Save Template" data-fa="ذخیره قالب">Save Template</button>
+        </div>
+        <div class="card">
+          <div class="card-hd"><div class="card-title" data-en="Panel Access Path" data-fa="مسیر دسترسی پنل">Panel Access Path</div></div>
+          <div class="fg"><label class="fl" data-en="Custom Path" data-fa="مسیر سفارشی">Custom Path</label><input class="fi" type="text" id="panel-path" data-ph-en="/login" data-ph-fa="/login" placeholder="/login"></div>
+          <div style="font-size:12px;color:var(--text3);margin-top:6px;line-height:1.5" data-en="Change the panel URL path (e.g. /my-secret-panel)" data-fa="تغییر مسیر دسترسی به پنل (مثلاً /my-secret-panel)">Change the panel URL path (e.g. /my-secret-panel)</div>
+          <div style="font-size:11px;color:var(--gold);margin-top:8px;font-weight:600" id="panel-path-display"></div>
+          <button class="btn btn-gold" onclick="savePanelPath()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Save Path" data-fa="ذخیره مسیر">Save Path</button>
         </div>
       </div>
       <div class="card" style="margin-top: 14px;">
@@ -2450,21 +2562,30 @@ body[dir="rtl"]{direction:rtl;text-align:right}
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="ADD INBOUND" data-fa="افزودن اینباند">ADD INBOUND</div>
-    <div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="nl" data-ph-en="e.g. User 1" data-ph-fa="مثلاً کاربر ۱" placeholder="e.g. User 1"></div>
-    <div class="fr">
-      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option><option>MB</option><option>KB</option></select></div>
+    <div style="display:flex; gap:10px; margin-bottom:15px; border-bottom: 1px solid var(--border);">
+      <div id="add-tab-btn-gen" style="cursor:pointer; padding-bottom:5px; border-bottom: 2px solid var(--gold); color:var(--gold);" onclick="switchTab('add', 'gen')" data-en="General" data-fa="عمومی">General</div>
+      <div id="add-tab-btn-bl" style="cursor:pointer; padding-bottom:5px; border-bottom: 2px solid transparent; color:var(--text3);" onclick="switchTab('add', 'bl')" data-en="Blacklist" data-fa="بلک‌لیست">Blacklist</div>
     </div>
-    <div class="fr">
-      <div class="fg"><label class="fl" data-en="Daily Limit" data-fa="محدودیت روزانه">Daily Limit</label><input class="fi" id="ndv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="ndu"><option>GB</option><option>MB</option><option>KB</option></select></div>
+    <div id="add-tab-gen">
+      <div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="nl" data-ph-en="e.g. User 1" data-ph-fa="مثلاً کاربر ۱" placeholder="e.g. User 1"></div>
+      <div class="fr">
+        <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+        <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option><option>MB</option><option>KB</option></select></div>
+      </div>
+      <div class="fr">
+        <div class="fg"><label class="fl" data-en="Daily Limit" data-fa="محدودیت روزانه">Daily Limit</label><input class="fi" id="ndv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+        <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="ndu"><option>GB</option><option>MB</option><option>KB</option></select></div>
+      </div>
+      <div class="fr">
+        <div class="fg"><label class="fl" data-en="Expiry" data-fa="انقضا">Expiry</label><input class="fi" id="ne" type="number" min="0" step="1" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
+        <div class="fg" style="max-width:120px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu2"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></div>
+      </div>
+      <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div class="fg"><label class="fl" data-en="Clean IP Count" data-fa="تعداد آی‌پی تمیز">Clean IP Count</label><input class="fi" id="ncip" type="number" min="0" data-ph-en="0 = none" data-ph-fa="۰ = بدون انتخاب" placeholder="0 = none"></div>
     </div>
-    <div class="fr">
-      <div class="fg"><label class="fl" data-en="Expiry" data-fa="انقضا">Expiry</label><input class="fi" id="ne" type="number" min="0" step="1" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
-      <div class="fg" style="max-width:120px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu2"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></div>
+    <div id="add-tab-bl" style="display:none;">
+      <div class="fg"><label class="fl" data-en="Blacklisted Domains (one per line)" data-fa="دامنه‌های مسدود (هر خط یک دامنه)">Blacklisted Domains (one per line)</label><textarea class="fi" id="nbl" rows="8" placeholder="instagram.com&#10;telegram.org" style="resize:vertical;font-family:monospace;"></textarea></div>
     </div>
-    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-    <div class="fg"><label class="fl" data-en="Clean IP Count" data-fa="تعداد آی‌پی تمیز">Clean IP Count</label><input class="fi" id="ncip" type="number" min="0" data-ph-en="0 = none" data-ph-fa="۰ = بدون انتخاب" placeholder="0 = none"></div>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
   </div>
 </div>
@@ -2473,21 +2594,39 @@ body[dir="rtl"]{direction:rtl;text-align:right}
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
     <div class="mo-title" id="et">EDIT INBOUND</div>
-    <input type="hidden" id="eu">
-    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" readonly style="opacity:.5;cursor:not-allowed"></div>
-    <div class="fr">
-      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option><option>MB</option><option>KB</option></select></div>
+    <div style="display:flex; gap:10px; margin-bottom:15px; border-bottom: 1px solid var(--border);">
+      <div id="edit-tab-btn-gen" style="cursor:pointer; padding-bottom:5px; border-bottom: 2px solid var(--gold); color:var(--gold);" onclick="switchTab('edit', 'gen')" data-en="General" data-fa="عمومی">General</div>
+      <div id="edit-tab-btn-bl" style="cursor:pointer; padding-bottom:5px; border-bottom: 2px solid transparent; color:var(--text3);" onclick="switchTab('edit', 'bl')" data-en="Blacklist" data-fa="بلک‌لیست">Blacklist</div>
     </div>
-    <div class="fr">
-      <div class="fg"><label class="fl" data-en="Daily Limit" data-fa="محدودیت روزانه">Daily Limit</label><input class="fi" id="edv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="edu2"><option>GB</option><option>MB</option><option>KB</option></select></div>
+    <div id="edit-tab-gen">
+      <input type="hidden" id="eu">
+      <div style="padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border)">
+        <div class="fg"><label class="fl" data-en="UUID" data-fa="UUID (شناسه کاربر)">UUID</label>
+          <div style="display:flex;gap:8px">
+            <input class="fi" id="euuid" style="flex:1">
+            <button class="btn btn-gold" onclick="saveNewUUID()" data-en="Save UUID" data-fa="ذخیره شناسه" style="padding:0 12px">Save</button>
+          </div>
+        </div>
+      </div>
+      <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" readonly style="opacity:.5;cursor:not-allowed"></div>
+      <div class="fg"><label class="fl" data-en="Config Name Template (Optional)" data-fa="قالب نام کانفیگ مجزا (اختیاری)">Config Name Template (Optional)</label><input class="fi" id="etpl" data-ph-en="Leave empty to use default" data-ph-fa="خالی بگذارید تا از پیش‌فرض استفاده شود" placeholder="Leave empty to use default"></div>
+      <div class="fr">
+        <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+        <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option><option>MB</option><option>KB</option></select></div>
+      </div>
+      <div class="fr">
+        <div class="fg"><label class="fl" data-en="Daily Limit" data-fa="محدودیت روزانه">Daily Limit</label><input class="fi" id="edv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+        <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="edu2"><option>GB</option><option>MB</option><option>KB</option></select></div>
+      </div>
+      <div class="fr">
+        <div class="fg"><label class="fl" data-en="Extend" data-fa="افزایش">Extend</label><input class="fi" id="ed" type="number" min="0" step="1" data-ph-en="0 = no change" data-ph-fa="۰ = بدون تغییر" placeholder="0 = no change"></div>
+        <div class="fg" style="max-width:120px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu3"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></div>
+      </div>
+      <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
     </div>
-    <div class="fr">
-      <div class="fg"><label class="fl" data-en="Extend" data-fa="افزایش">Extend</label><input class="fi" id="ed" type="number" min="0" step="1" data-ph-en="0 = no change" data-ph-fa="۰ = بدون تغییر" placeholder="0 = no change"></div>
-      <div class="fg" style="max-width:120px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu3"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></div>
+    <div id="edit-tab-bl" style="display:none;">
+      <div class="fg"><label class="fl" data-en="Blacklisted Domains (one per line)" data-fa="دامنه‌های مسدود (هر خط یک دامنه)">Blacklisted Domains (one per line)</label><textarea class="fi" id="ebl" rows="8" placeholder="instagram.com&#10;telegram.org" style="resize:vertical;font-family:monospace;"></textarea></div>
     </div>
-    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
     <div style="display:flex;gap:10px;margin-top:16px">
       <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center;padding:12px;" data-en="SAVE" data-fa="ذخیره">SAVE</button>
       <button class="btn btn-danger" onclick="resetTraf()" style="padding:12px;" data-en="Reset" data-fa="بازنشانی ترافیک">Reset</button>
@@ -2849,6 +2988,18 @@ async function togLink(el){
   }catch(e){toast('Failed to toggle',true);}
 }
 
+function switchTab(modalId, tabId) {
+  $m(modalId + '-tab-btn-gen').style.borderBottomColor = 'transparent';
+  $m(modalId + '-tab-btn-gen').style.color = 'var(--text3)';
+  $m(modalId + '-tab-btn-bl').style.borderBottomColor = 'transparent';
+  $m(modalId + '-tab-btn-bl').style.color = 'var(--text3)';
+  $m(modalId + '-tab-gen').style.display = 'none';
+  $m(modalId + '-tab-bl').style.display = 'none';
+  $m(modalId + '-tab-btn-' + tabId).style.borderBottomColor = 'var(--gold)';
+  $m(modalId + '-tab-btn-' + tabId).style.color = 'var(--gold)';
+  $m(modalId + '-tab-' + tabId).style.display = 'block';
+}
+
 function showAddMo(){$m('mo-add').classList.add('show');}
 
 async function createLink(){
@@ -2875,12 +3026,13 @@ async function createLink(){
         expiry_value:expiryValue,
         expiry_unit:expiryUnit,
         max_connections:mc,
-        clean_ip_count:cleanIpCount
+        clean_ip_count:cleanIpCount,
+        blacklist: $m('nbl').value.split('\n').map(s=>s.trim()).filter(s=>s)
       })
     });
     if(!r.ok)throw new Error();
     toast('Created');
-    $m('nl').value='';$m('nv').value='';$m('ndv').value='';$m('nc').value='';$m('ncip').value='';$m('ne').value='';
+    $m('nl').value='';$m('nv').value='';$m('ndv').value='';$m('nc').value='';$m('ncip').value='';$m('ne').value='';$m('nbl').value='';
     $m('mo-add').classList.remove('show');
     await loadLinks();
     await loadStats();
@@ -2891,7 +3043,9 @@ function showEditMo(uid){
   const l=allLinks.find(x=>x.uuid===uid);
   if(!l)return;
   $m('eu').value=uid;
+  $m('euuid').value=uid;
   $m('en2').value=l.label;
+  $m('etpl').value=l.config_name_template||'';
   $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
   $m('eu2').value='GB';
   $m('edv').value=l.daily_limit_bytes>0?(l.daily_limit_bytes/1073741824):'';
@@ -2899,8 +3053,32 @@ function showEditMo(uid){
   $m('ec').value=l.max_connections>0?l.max_connections:'';
   $m('ed').value='';
   $m('eu3').value='days';
+  $m('ebl').value=l.blacklist ? l.blacklist.join('\n') : '';
   $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
   $m('mo-edit').classList.add('show');
+}
+
+async function saveNewUUID() {
+  const uid = $m('eu').value;
+  const newUuid = $m('euuid').value.trim();
+  if(!newUuid || newUuid === uid) return;
+  if(!confirm('Changing UUID will disconnect active users and old links will stop working. Continue?')) return;
+  try {
+    const r = await fetch('/api/links/'+uid+'/uuid', {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({new_uuid: newUuid})
+    });
+    if(!r.ok) {
+      const d = await r.json().catch(()=>({}));
+      throw new Error(d.detail || 'Error changing UUID');
+    }
+    toast('UUID changed successfully!');
+    $m('mo-edit').classList.remove('show');
+    await loadLinks();
+  } catch(e) {
+    toast(e.message, true);
+  }
 }
 
 async function saveEdit(){
@@ -2916,6 +3094,8 @@ async function saveEdit(){
   const expiryUnit=$m('eu3').value||'days';
   const mcRaw=$m('ec').value;
   const mc=parseInt(mcRaw);
+  const tpl=$m('etpl').value.trim();
+  const blacklist=$m('ebl').value.split('\n').map(s=>s.trim()).filter(s=>s);
   const body={};
   if(vRaw !== '' && !Number.isNaN(v)){
     body.limit_value=v;
@@ -2932,6 +3112,8 @@ async function saveEdit(){
   if(mcRaw !== '' && !Number.isNaN(mc)){
     body.max_connections=mc;
   }
+  body.config_name_template = tpl;
+  body.blacklist = blacklist;
   if(Object.keys(body).length === 0){
     toast('No changes to save', true);
     return;
@@ -3009,6 +3191,8 @@ async function loadSettings(){
       $m('tg-token').value = d.telegram_token || '';
       $m('tg-admin-id').value = d.telegram_admin_id || '';
       $m('cfg-template').value = d.config_name_template || '{IP}-{USER}-{PORT}-{INDEX}';
+      $m('panel-path').value = d.panel_path || '/login';
+      $m('panel-path-display').textContent = 'Current Path: ' + (d.panel_path || '/login');
     }
   } catch(e){}
 }
@@ -3016,12 +3200,11 @@ async function loadSettings(){
 async function saveSettings(){
   const tok = $m('tg-token').value.trim();
   const adm = $m('tg-admin-id').value.trim();
-  const cfg = $m('cfg-template').value.trim() || '{IP}-{USER}-{PORT}-{INDEX}';
   try {
     const r = await fetch('/api/settings', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({telegram_token: tok, telegram_admin_id: adm, config_name_template: cfg})
+      body: JSON.stringify({telegram_token: tok, telegram_admin_id: adm})
     });
     if (r.ok) {
       toast('Bot settings saved & restarted');
@@ -3029,6 +3212,41 @@ async function saveSettings(){
       toast('Failed to save settings', true);
     }
   } catch(e){toast('Error saving settings', true);}
+}
+
+async function saveConfigTemplate(){
+  const cfg = $m('cfg-template').value.trim();
+  try {
+    const r = await fetch('/api/settings/config-template', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({config_name_template: cfg})
+    });
+    if (r.ok) {
+      toast('Config template saved');
+    } else {
+      toast('Failed to save config template', true);
+    }
+  } catch(e){toast('Error saving config template', true);}
+}
+
+async function savePanelPath(){
+  const p = $m('panel-path').value.trim();
+  try {
+    const r = await fetch('/api/settings/panel-path', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({panel_path: p})
+    });
+    if (r.ok) {
+      const d = await r.json();
+      toast('Panel path updated to ' + d.panel_path);
+      $m('panel-path-display').textContent = 'Current Path: ' + d.panel_path;
+      setTimeout(() => { window.location.href = d.panel_path; }, 1000);
+    } else {
+      toast('Failed to save panel path', true);
+    }
+  } catch(e){toast('Error saving panel path', true);}
 }
 
 async function loadStats(){
@@ -3041,6 +3259,9 @@ async function loadStats(){
     $m('sv-links').textContent=sData.links_count||0;
     $m('sv-uptime').textContent=sData.uptime||'–';
     $m('sv-domain').textContent=sData.domain||'–';
+    if($m('sv-active')) $m('sv-active').textContent=sData.active_users||0;
+    if($m('sv-inactive')) $m('sv-inactive').textContent=sData.inactive_users||0;
+    if($m('sv-expired')) $m('sv-expired').textContent=sData.expired_users||0;
     $m('nb').textContent=sData.links_count||0;
     $m('last-up').textContent='Updated '+new Date().toLocaleTimeString();
     if($m('t-tr'))$m('t-tr').textContent=(sData.total_traffic_mb||0)+' MB';
@@ -3252,15 +3473,37 @@ startPolling();
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
+    panel_path = CONFIG.get("panel_path", "/login")
+    if not panel_path.startswith("/"):
+        panel_path = "/" + panel_path
+    if panel_path != "/login":
+        raise HTTPException(status_code=404, detail="Not Found")
     return HTMLResponse(content=PANEL_HTML)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
+    panel_path = CONFIG.get("panel_path", "/login")
+    if not panel_path.startswith("/"):
+        panel_path = "/" + panel_path
+    if panel_path != "/dashboard":
+        raise HTTPException(status_code=404, detail="Not Found")
     return HTMLResponse(content=PANEL_HTML)
 
 @app.get("/panel", response_class=HTMLResponse)
 async def panel_page(request: Request):
+    panel_path = CONFIG.get("panel_path", "/login")
+    if not panel_path.startswith("/"):
+        panel_path = "/" + panel_path
+    if panel_path != "/panel":
+        raise HTTPException(status_code=404, detail="Not Found")
     return HTMLResponse(content=PANEL_HTML)
 
+@app.api_route("/{custom_path:path}", methods=["GET"], response_class=HTMLResponse)
+async def dynamic_panel_route(custom_path: str, request: Request):
+    panel_path = CONFIG.get("panel_path", "/login").lstrip("/")
+    if custom_path == panel_path:
+        return HTMLResponse(content=PANEL_HTML)
+    raise HTTPException(status_code=404, detail="Not Found")
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
+    uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"]) 
